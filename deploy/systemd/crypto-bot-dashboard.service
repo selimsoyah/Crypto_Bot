@@ -1,0 +1,21 @@
+[Unit]
+Description=Crypto Bot Streamlit Dashboard (TESTNET)
+Documentation=file:///home/ubuntu/Crypto_Bot/deploy/ORACLE_DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Crypto_Bot
+Environment=PATH=/home/ubuntu/Crypto_Bot/venv/bin:/usr/bin
+ExecStart=/home/ubuntu/Crypto_Bot/venv/bin/streamlit run dashboard.py --server.address=127.0.0.1 --server.port=8501
+Restart=on-failure
+RestartSec=10
+# Graceful stop for Streamlit
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

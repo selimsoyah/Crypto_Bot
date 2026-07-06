@@ -1,0 +1,55 @@
+# Secrets — never commit
+.env
+*.pem
+keys.txt
+*credentials*
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime / local state
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.bot_*
+.bot_instance.lock
+bot_status_log.csv
+
+# Regenerable data & model artifacts (see data_pipeline.py / model_brain.py)
+historical_btc.parquet
+historical_btc_15m.parquet
+xgboost_trading_model.json
+xgboost_trading_model_f2.json
+xgboost_trading_model*.json
+
+# Session outputs
+session_summary_report.md
+session_summary_*.pdf
+session_exports/
+retrain_log.txt
+
+# Generated reports (regenerate via scripts)
+backtest_report.md
+feature_sweep_report.md
+label_sweep_report.md
+threshold_sweep_report.md
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

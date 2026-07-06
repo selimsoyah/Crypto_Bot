@@ -1,0 +1,15 @@
+# Streamlit server config for Oracle VM deployment.
+# Binds to localhost only — access the dashboard via SSH tunnel from your PC.
+# Copied to ~/.streamlit/config.toml by deploy/scripts/install_server.sh
+
+[server]
+headless = true
+address = "127.0.0.1"
+port = 8501
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+serverAddress = "localhost"
+serverPort = 8501
