@@ -156,6 +156,53 @@ def test_essential_metrics_includes_wallet_from_log():
     assert m["wallet_balance"] == pytest.approx(4321.5)
 
 
+def test_status_to_activity_rows_filters_heartbeats():
+    log = pd.DataFrame(
+        [
+            {
+                "Timestamp": "2026-07-06 12:00:00",
+                "Action": "HOLD",
+                "Event": "WAIT",
+                "Open_Position": "FLAT",
+                "Reason": "scanning",
+            },
+            {
+                "Timestamp": "2026-07-06 12:01:00",
+                "Action": "SKIPPED_LONG_POST_ONLY",
+                "Event": "WARNING",
+                "Open_Position": "FLAT",
+                "Reason": "Post-only order rejected",
+            },
+        ]
+    )
+    rows = dashboard_stats.status_to_activity_rows(log)
+    assert len(rows) == 1
+    assert rows[0]["action"] == "SKIPPED_LONG_POST_ONLY"
+    assert rows[0]["tone"] == "warn"
+
+
+def test_open_position_row_from_exchange():
+    row = dashboard_stats.open_position_row(
+        {
+            "status": "ok",
+            "side": "LONG",
+            "entry_price": 60_000.0,
+            "mark_price": 59_900.0,
+            "unrealized_pnl": -0.76,
+        }
+    )
+    assert row is not None
+    assert row["status"] == "OPEN"
+    assert row["pnl"] == pytest.approx(-0.76)
+
+
+def test_position_mismatch_warning_when_exchange_open_log_flat():
+    log = pd.DataFrame([{"Open_Position": "FLAT"}])
+    exchange = {"status": "ok", "side": "LONG"}
+    msg = dashboard_stats.position_mismatch_warning(log, exchange)
+    assert "open LONG" in msg
+
+
 def test_bot_health_live_when_recent_log(bot):
     log = pd.DataFrame(
         [
@@ -171,6 +218,23 @@ def test_bot_health_live_when_recent_log(bot):
     h = dashboard_stats.bot_health(bot, log)
     assert h["status"] == "LIVE"
     assert h["running"] is True
+
+
+def test_bot_health_uses_exchange_position_when_open(bot):
+    log = pd.DataFrame(
+        [
+            {
+                "Timestamp": pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S"),
+                "Action": "SKIPPED_LONG_POST_ONLY",
+                "Event": "WARNING",
+                "Open_Position": "FLAT",
+            }
+        ]
+    )
+    exchange = {"status": "ok", "side": "LONG", "unrealized_pnl": -0.76}
+    h = dashboard_stats.bot_health(bot, log, exchange_pos=exchange)
+    assert h["open_position"] == "LONG"
+    assert h["position_source"] == "exchange"
 
 
 def test_bot_health_booting_when_running_without_log(bot):

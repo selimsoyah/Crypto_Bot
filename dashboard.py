@@ -280,6 +280,19 @@ _GLOBAL_CSS = """
         text-align: center;
         font-size: 0.9rem;
     }
+    .tl-open td { color: #38bdf8 !important; text-shadow: 0 0 6px rgba(56, 189, 248, 0.35); }
+    .tl-activity-wrap { margin-bottom: 14px; }
+    .tl-activity-table td { font-size: 0.8rem; vertical-align: top; }
+    .tl-act-warn { color: #fbbf24 !important; text-shadow: 0 0 6px rgba(251, 191, 36, 0.35); }
+    .tl-act-open { color: #38bdf8 !important; }
+    .tl-act-close { color: #39ff14 !important; }
+    .tl-subtitle {
+        color: #64748B;
+        font-size: 0.72rem;
+        letter-spacing: 1px;
+        margin: -6px 0 10px 0;
+        text-transform: uppercase;
+    }
 
     /* ---- Essential metrics strip ----------------------------------- */
     .ess-grid {
@@ -410,9 +423,9 @@ compute_session_risk_pnl = dashboard_stats.compute_session_risk_pnl
 allocation_label_from_risk = dashboard_stats.allocation_label_from_risk
 
 
-def render_bot_heartbeat(bot, log: pd.DataFrame) -> None:
+def render_bot_heartbeat(bot, log: pd.DataFrame, exchange_pos: dict | None = None) -> None:
     """Main-page engine heartbeat — confirms the bot is scanning and healthy."""
-    h = dashboard_stats.bot_health(bot, log)
+    h = dashboard_stats.bot_health(bot, log, exchange_pos=exchange_pos)
     strip_cls = {"LIVE": "hb-live", "BOOTING": "hb-live", "DEGRADED": "hb-warn", "STALE": "hb-warn", "OFFLINE": "hb-off"}.get(
         h["status"], "hb-off"
     )
@@ -438,7 +451,8 @@ def render_bot_heartbeat(bot, log: pd.DataFrame) -> None:
         f'<span class="{status_cls}">ENGINE {html.escape(h["status"])}</span>'
         f'<span class="hb-meta">Last scan: {html.escape(h["last_scan"])} ({age})</span>'
         f'<span class="hb-meta">Action: {html.escape(h["last_action"])}</span>'
-        f'<span class="hb-meta">Position: {html.escape(h["open_position"])}</span>'
+        f'<span class="hb-meta">Position: {html.escape(h["open_position"])}'
+        f'{" (exchange)" if h.get("position_source") == "exchange" else ""}</span>'
         f'<span class="hb-detail">{html.escape(h["detail"])}</span>'
         f"</div>",
         unsafe_allow_html=True,
@@ -531,45 +545,115 @@ def render_compound_strip(trades: pd.DataFrame, log: pd.DataFrame, bot=None) -> 
     )
 
 
-def render_trade_log(trades: pd.DataFrame, max_rows: int = 50) -> None:
-    """Retro terminal trade log table — green wins, red losses."""
+def render_activity_log(log: pd.DataFrame, max_rows: int = 25) -> None:
+    """Session activity from status-log transitions (skips, opens, blocks)."""
+    rows = dashboard_stats.status_to_activity_rows(log, max_rows=max_rows)
+    st.markdown(
+        '<div class="trade-log-title">Session Activity</div>'
+        '<div class="tl-subtitle">Opens · closes · skipped signals (live)</div>',
+        unsafe_allow_html=True,
+    )
+    if not rows:
+        st.markdown(
+            '<div class="tl-empty">No engine events yet — boot to begin scanning.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    table_rows = []
+    for r in rows:
+        tone_cls = {
+            "warn": "tl-act-warn",
+            "open": "tl-act-open",
+            "close": "tl-act-close",
+        }.get(r["tone"], "")
+        table_rows.append(
+            f"<tr>"
+            f'<td class="tl-muted">{html.escape(r["time"])}</td>'
+            f'<td class="{tone_cls}">{html.escape(r["action"])}</td>'
+            f'<td class="tl-muted">{html.escape(r["position"])}</td>'
+            f'<td class="{tone_cls}">{html.escape(r["reason"])}</td>'
+            f"</tr>"
+        )
+    st.markdown(
+        '<div class="trade-log-wrap tl-activity-wrap">'
+        '<table class="trade-log-table tl-activity-table">'
+        "<thead><tr><th>TIME</th><th>ACTION</th><th>POS</th><th>DETAIL</th></tr></thead>"
+        "<tbody>" + "".join(table_rows) + "</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_trade_log(
+    trades: pd.DataFrame,
+    exchange_pos: dict | None = None,
+    max_rows: int = 50,
+) -> None:
+    """Retro terminal trade log table — closed trades + live open row."""
     rows = dashboard_stats.trades_to_log_rows(trades)
+    open_row = dashboard_stats.open_position_row(exchange_pos)
+    if open_row:
+        rows = [open_row, *rows]
     if max_rows:
         rows = rows[-max_rows:]
 
+    st.markdown(
+        '<div class="trade-log-title">Closed Trades</div>'
+        '<div class="tl-subtitle">Completed round-trips only · open row shows exchange position</div>',
+        unsafe_allow_html=True,
+    )
+
     if not rows:
-        body = '<div class="tl-empty">No closed trades yet — boot the engine to begin.</div>'
-        table = ""
-    else:
-        table_rows = []
-        for r in rows:
-            cls = "tl-win" if r["won"] else "tl-loss"
+        st.markdown(
+            '<div class="trade-log-wrap"><div class="tl-empty">'
+            "No closed trades yet — session activity above shows skips and signals."
+            "</div></div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    table_rows = []
+    for r in rows:
+        if r.get("open"):
+            cls = "tl-open"
+            status = "OPEN"
             pnl_sign = "+" if r["pnl"] >= 0 else ""
             table_rows.append(
                 f"<tr>"
-                f'<td class="tl-muted">{html.escape(r["time"])}</td>'
+                f'<td class="tl-muted">{html.escape(str(r["time"]))}</td>'
                 f'<td class="{cls}">{html.escape(r["side"])}</td>'
                 f'<td class="tl-muted">{r["entry"]:,.2f}</td>'
                 f'<td class="tl-muted">{r["exit"]:,.2f}</td>'
                 f'<td class="tl-muted">{r["sh"]}</td>'
-                f'<td class="{cls}">{html.escape(r["status"])}</td>'
+                f'<td class="{cls}">{status}</td>'
                 f'<td class="{cls}">{pnl_sign}{r["pnl"]:.2f}</td>'
                 f"</tr>"
             )
-        table = (
-            '<table class="trade-log-table">'
-            "<thead><tr>"
-            "<th>TIME</th><th>SIDE</th><th>ENTRY</th><th>EXIT</th>"
-            "<th>SH</th><th>STATUS</th><th>PNL</th>"
-            "</tr></thead><tbody>"
-            + "".join(table_rows)
-            + "</tbody></table>"
+            continue
+
+        cls = "tl-win" if r["won"] else "tl-loss"
+        pnl_sign = "+" if r["pnl"] >= 0 else ""
+        table_rows.append(
+            f"<tr>"
+            f'<td class="tl-muted">{html.escape(r["time"])}</td>'
+            f'<td class="{cls}">{html.escape(r["side"])}</td>'
+            f'<td class="tl-muted">{r["entry"]:,.2f}</td>'
+            f'<td class="tl-muted">{r["exit"]:,.2f}</td>'
+            f'<td class="tl-muted">{r["sh"]}</td>'
+            f'<td class="{cls}">{html.escape(r["status"])}</td>'
+            f'<td class="{cls}">{pnl_sign}{r["pnl"]:.2f}</td>'
+            f"</tr>"
         )
-        body = table
 
     st.markdown(
-        f'<div class="trade-log-wrap">'
-        f'<div class="trade-log-title">Trade Log</div>{body}</div>',
+        '<div class="trade-log-wrap">'
+        '<table class="trade-log-table">'
+        "<thead><tr>"
+        "<th>TIME</th><th>SIDE</th><th>ENTRY</th><th>EXIT</th>"
+        "<th>SH</th><th>STATUS</th><th>PNL</th>"
+        "</tr></thead><tbody>"
+        + "".join(table_rows)
+        + "</tbody></table></div>",
         unsafe_allow_html=True,
     )
 
@@ -1127,20 +1211,24 @@ st.caption(config.execution_banner_text())
 
 log_df = load_log()
 trades_df = load_trades()
-stats = compute_stats(log_df, trades_df)
 exchange_pos = fetch_live_position()
+stats = compute_stats(log_df, trades_df)
+mismatch = dashboard_stats.position_mismatch_warning(log_df, exchange_pos)
+if mismatch:
+    stats.setdefault("data_warnings", []).append(mismatch)
 
 for warning in stats.get("data_warnings", []):
     st.warning(warning)
 
 bot = get_bot()
-render_bot_heartbeat(bot, log_df)
+render_bot_heartbeat(bot, log_df, exchange_pos=exchange_pos)
 render_essential_metrics(trades_df, log_df, exchange_pos=exchange_pos, bot=bot)
 render_compound_strip(trades_df, log_df, bot=bot)
 
 log_col, chart_col = st.columns([1.1, 1])
 with log_col:
-    render_trade_log(trades_df, max_rows=50)
+    render_activity_log(log_df, max_rows=25)
+    render_trade_log(trades_df, exchange_pos=exchange_pos, max_rows=50)
 with chart_col:
     st.markdown(
         '<div class="trade-log-title" style="margin-bottom:10px;">Chart</div>',

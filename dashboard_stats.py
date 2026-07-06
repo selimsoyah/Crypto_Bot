@@ -253,6 +253,112 @@ def _parse_ts(ts: str) -> Optional[pd.Timestamp]:
         return None
 
 
+_ACTIVITY_ACTION_PREFIXES = (
+    "OPEN_",
+    "CLOSE_",
+    "SKIPPED_",
+    "BLOCKED_",
+    "EXIT_PENDING_",
+    "RISK_",
+)
+_ACTIVITY_EVENTS = frozenset(
+    {"WARNING", "BUY_LONG", "SHORT_ORDER", "STOP_LOSS", "FILL_SUCCESS", "BOOT"}
+)
+
+
+def _is_activity_row(action: str, event: str) -> bool:
+    action = action or ""
+    event = event or ""
+    if any(action.startswith(prefix) for prefix in _ACTIVITY_ACTION_PREFIXES):
+        return True
+    return event in _ACTIVITY_EVENTS
+
+
+def status_to_activity_rows(log: pd.DataFrame, max_rows: int = 40) -> list[dict]:
+    """Convert status-log transitions into operator-facing activity rows."""
+    if log.empty:
+        return []
+
+    rows: list[dict] = []
+    for _, row in log.iterrows():
+        action = str(row.get("Action", "") or "")
+        event = str(row.get("Event", "") or "")
+        if not _is_activity_row(action, event):
+            continue
+
+        ts = _parse_ts(str(row.get("Timestamp", "")))
+        time_str = ts.strftime("%H:%M:%S") if ts is not None and pd.notna(ts) else "--:--:--"
+        reason = str(row.get("Reason", "") or "")
+        if len(reason) > 120:
+            reason = reason[:117] + "..."
+
+        tone = "info"
+        if action.startswith(("SKIPPED_", "BLOCKED_", "EXIT_PENDING_")) or event == "WARNING":
+            tone = "warn"
+        elif action.startswith("OPEN_") or event in ("BUY_LONG", "SHORT_ORDER"):
+            tone = "open"
+        elif action.startswith("CLOSE_") or event in ("STOP_LOSS", "FILL_SUCCESS"):
+            tone = "close"
+
+        rows.append(
+            {
+                "time": time_str,
+                "action": action,
+                "event": event,
+                "position": str(row.get("Open_Position", "FLAT") or "FLAT"),
+                "reason": reason,
+                "tone": tone,
+            }
+        )
+
+    if max_rows and len(rows) > max_rows:
+        rows = rows[-max_rows:]
+    return rows
+
+
+def open_position_row(exchange_pos: Optional[dict]) -> Optional[dict]:
+    """Build a synthetic open-position row when the exchange still holds size."""
+    if not exchange_pos or exchange_pos.get("status") != "ok":
+        return None
+    pnl = float(exchange_pos.get("unrealized_pnl", 0.0) or 0.0)
+    side = str(exchange_pos.get("side", "FLAT"))
+    return {
+        "time": "LIVE",
+        "side": "Up" if side == "LONG" else "Down",
+        "entry": float(exchange_pos.get("entry_price", 0.0) or 0.0),
+        "exit": float(exchange_pos.get("mark_price", 0.0) or 0.0),
+        "sh": "—",
+        "status": "OPEN",
+        "pnl": pnl,
+        "won": pnl >= 0,
+        "open": True,
+    }
+
+
+def position_mismatch_warning(
+    log: pd.DataFrame,
+    exchange_pos: Optional[dict],
+) -> str:
+    """Warn when exchange position disagrees with the latest status-log row."""
+    if log.empty or not exchange_pos:
+        return ""
+    if exchange_pos.get("status") != "ok":
+        return ""
+    log_side = str(log.iloc[-1].get("Open_Position", "FLAT") or "FLAT").upper()
+    ex_side = str(exchange_pos.get("side", "FLAT") or "FLAT").upper()
+    if log_side == "FLAT" and ex_side in ("LONG", "SHORT"):
+        return (
+            f"Exchange reports an open {ex_side} position, but the status log shows FLAT. "
+            "Open PnL is from the exchange; boot the engine or flatten manually."
+        )
+    if log_side in ("LONG", "SHORT") and exchange_pos.get("status") == "flat":
+        return (
+            f"Status log shows {log_side}, but the exchange reports flat. "
+            "Metrics may be stale until the next scan."
+        )
+    return ""
+
+
 def trades_to_log_rows(trades: pd.DataFrame) -> list[dict]:
     """Convert ground-truth trades into terminal log row dicts."""
     if trades.empty:
@@ -427,7 +533,11 @@ def threshold_distance(
     return _dist(prob_long, prob_short, long_thr, short_thr)
 
 
-def bot_health(bot, log: pd.DataFrame) -> dict:
+def bot_health(
+    bot,
+    log: pd.DataFrame,
+    exchange_pos: Optional[dict] = None,
+) -> dict:
     """Heartbeat snapshot — is the engine alive and scanning?"""
     running = bool(bot is not None and bot.state.running)
     degraded = bool(bot is not None and bot.state.connection_degraded)
@@ -437,6 +547,7 @@ def bot_health(bot, log: pd.DataFrame) -> dict:
     seconds_ago: Optional[float] = None
     stale = True
     open_position = "FLAT"
+    position_source = "log"
 
     if not log.empty:
         last = log.iloc[-1]
@@ -453,6 +564,10 @@ def bot_health(bot, log: pd.DataFrame) -> dict:
             last_scan_str = last_scan.strftime("%H:%M:%S UTC")
             stale_threshold = max(30.0, config.LOOP_SLEEP_SECONDS * 4)
             stale = seconds_ago > stale_threshold
+
+    if exchange_pos and exchange_pos.get("status") == "ok":
+        open_position = str(exchange_pos.get("side", open_position))
+        position_source = "exchange"
 
     if not running:
         status = "OFFLINE"
@@ -488,6 +603,10 @@ def bot_health(bot, log: pd.DataFrame) -> dict:
         status = "LIVE"
         detail = f"Scanning every {config.LOOP_SLEEP_SECONDS}s · last action {last_action}"
 
+    mismatch = position_mismatch_warning(log, exchange_pos)
+    if mismatch and status in ("OFFLINE", "STALE"):
+        detail = f"{detail} {mismatch}"
+
     return {
         "status": status,
         "running": running,
@@ -498,5 +617,6 @@ def bot_health(bot, log: pd.DataFrame) -> dict:
         "last_action": last_action,
         "last_event": last_event,
         "open_position": open_position,
+        "position_source": position_source,
         "detail": detail,
     }
