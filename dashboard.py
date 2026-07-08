@@ -233,6 +233,105 @@ except Exception:
     _AUTOREFRESH = False
 
 
+@st.cache_data(ttl=max(1, REFRESH_MS // 1000), show_spinner=False)
+def load_chart_candles() -> pd.DataFrame:
+    import data_pipeline
+
+    return data_pipeline.fetch_latest_candles(limit=max(300, config.LIVE_CANDLE_LOOKBACK))
+
+
+def render_darvas_box_sidebar(box_stats: dict) -> None:
+    if not config.is_darvas_box_profile():
+        return
+    st.divider()
+    st.markdown("### Darvas Box")
+    if not box_stats.get("valid"):
+        st.caption(box_stats.get("reason", "Waiting for previous-day OHLCV data."))
+        return
+    st.metric("Active Box ID", int(box_stats.get("active_box_number", 0)))
+    c1, c2 = st.columns(2)
+    c1.metric("Box Top", f"{float(box_stats.get('box_top', 0.0)):,.2f}")
+    c2.metric("Box Bottom", f"{float(box_stats.get('box_bottom', 0.0)):,.2f}")
+    st.metric("Middle Line", f"{float(box_stats.get('middle_line', 0.0)):,.2f}")
+    prev_day = box_stats.get("prev_day", "")
+    if prev_day:
+        st.caption(f"Anchored from previous UTC day: {prev_day}")
+
+
+def render_darvas_price_chart(candles: pd.DataFrame, box_stats: dict) -> None:
+    import plotly.graph_objects as go
+
+    if candles is None or candles.empty:
+        st.warning("No candle data available for Darvas box chart.")
+        return
+
+    frame = candles.copy()
+    if "Timestamp" in frame.columns:
+        frame["Timestamp"] = pd.to_datetime(frame["Timestamp"], utc=True, errors="coerce")
+        frame = frame.dropna(subset=["Timestamp"])
+    if frame.empty:
+        st.warning("Candle timestamps unavailable for chart.")
+        return
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Candlestick(
+            x=frame["Timestamp"],
+            open=frame["Open"],
+            high=frame["High"],
+            low=frame["Low"],
+            close=frame["Close"],
+            name="BTC/USDT",
+            increasing_line_color="#22c55e",
+            decreasing_line_color="#ef4444",
+        )
+    )
+
+    if box_stats.get("valid"):
+        top = float(box_stats["box_top"])
+        middle = float(box_stats["middle_line"])
+        bottom = float(box_stats["box_bottom"])
+        x0 = frame["Timestamp"].iloc[0]
+        x1 = frame["Timestamp"].iloc[-1]
+        lines = (
+            (top, "#f08080", "solid", "Box Top"),
+            (middle, "#e5e7eb", "dash", "Middle"),
+            (bottom, "#7dd3fc", "solid", "Box Bottom"),
+        )
+        for y_val, color, dash, label in lines:
+            fig.add_shape(
+                type="line",
+                x0=x0,
+                x1=x1,
+                y0=y_val,
+                y1=y_val,
+                line=dict(color=color, width=2, dash=dash),
+                layer="above",
+            )
+            fig.add_annotation(
+                x=x1,
+                y=y_val,
+                text=f"{label} {y_val:,.2f}",
+                showarrow=False,
+                xanchor="left",
+                xshift=6,
+                font=dict(color=color, size=11),
+            )
+
+    box_id = int(box_stats.get("active_box_number", 0))
+    title = f"15m BTC/USDT · Darvas box #{box_id}" if box_id else "15m BTC/USDT · Darvas box"
+    fig.update_layout(
+        template="plotly_dark",
+        height=480,
+        margin=dict(l=8, r=8, t=36, b=8),
+        xaxis_rangeslider_visible=False,
+        title=title,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
 @st.cache_resource(show_spinner=False)
 def get_store():
     from trade_store import TradeStore
@@ -431,23 +530,26 @@ def render_profile_badge(bot) -> None:
             tone = "pos"
         elif breakout == "SHORT":
             tone = "neg"
+        box_id = int(getattr(box, "active_box_number", 0))
+        middle = float(getattr(box, "middle_line", 0.0))
         st.markdown(
             "<div class='box-grid'>"
+            f"<div class='box-cell'><div class='box-k'>Active Box</div><div class='box-v'>#{box_id}</div></div>"
             f"<div class='box-cell'><div class='box-k'>Box Top</div><div class='box-v'>{float(getattr(box, 'top', 0.0)):,.2f}</div></div>"
+            f"<div class='box-cell'><div class='box-k'>Middle Line</div><div class='box-v'>{middle:,.2f}</div></div>"
             f"<div class='box-cell'><div class='box-k'>Box Bottom</div><div class='box-v'>{float(getattr(box, 'bottom', 0.0)):,.2f}</div></div>"
             f"<div class='box-cell'><div class='box-k'>Box Height</div><div class='box-v'>{float(getattr(box, 'height', 0.0)):,.2f}</div></div>"
             f"<div class='box-cell'><div class='box-k'>Breakout</div><div class='box-v {tone}'>{html.escape(breakout)}</div></div>"
             "</div>"
-            f"<div class='profile-sub'>Lookback {config.BOX_LOOKBACK_CANDLES} · Confirm {config.BOX_CONFIRMATION_CANDLES} · "
-            f"RR {config.BOX_RISK_REWARD_RATIO:.2f} · Vol x{config.BOX_VOLUME_FILTER_MULTIPLIER:.2f}</div>"
+            f"<div class='profile-sub'>Prev UTC day anchor · RR {config.BOX_RISK_REWARD_RATIO:.2f} · "
+            f"Vol x{config.BOX_VOLUME_FILTER_MULTIPLIER:.2f}</div>"
             "</div>",
             unsafe_allow_html=True,
         )
         return
 
     st.markdown(
-        "<div class='profile-sub'>Waiting for a confirmed live box. "
-        f"Need at least {config.BOX_LOOKBACK_CANDLES + config.BOX_CONFIRMATION_CANDLES} candles.</div>"
+        "<div class='profile-sub'>Waiting for previous UTC day OHLCV to anchor today's box boundaries.</div>"
         "</div>",
         unsafe_allow_html=True,
     )
@@ -819,7 +921,7 @@ def render_closed_trades(trades_df: pd.DataFrame, exchange_pos: Optional[dict]) 
     )
 
 
-def render_sidebar_controls(bot):
+def render_sidebar_controls(bot, box_stats: Optional[dict] = None):
     with st.sidebar:
         st.markdown("## Control")
         st.caption(config.execution_banner_text())
@@ -827,8 +929,7 @@ def render_sidebar_controls(bot):
             f"{config.SYMBOL} · {config.INTERVAL} · {config.LEVERAGE}x · "
             + (
                 (
-                    f"Box L{config.BOX_LOOKBACK_CANDLES}/C{config.BOX_CONFIRMATION_CANDLES} · "
-                    f"RR {config.BOX_RISK_REWARD_RATIO:.2f} · "
+                    f"Prev UTC day box · RR {config.BOX_RISK_REWARD_RATIO:.2f} · "
                     f"Vol x{config.BOX_VOLUME_FILTER_MULTIPLIER:.2f}"
                 )
                 if config.is_darvas_box_profile()
@@ -923,6 +1024,8 @@ def render_sidebar_controls(bot):
                 st.rerun()
 
         st.divider()
+        if box_stats is not None:
+            render_darvas_box_sidebar(box_stats)
         if not _AUTOREFRESH and st.button("Manual Refresh", use_container_width=True):
             st.rerun()
 
@@ -934,7 +1037,16 @@ if st.session_state.get("pending_session_pdf"):
 _show_shutdown_notice()
 
 bot = get_bot()
-render_sidebar_controls(bot)
+chart_candles = pd.DataFrame()
+darvas_box_stats: dict = {}
+if config.is_darvas_box_profile():
+    try:
+        chart_candles = load_chart_candles()
+        darvas_box_stats = dashboard_stats.darvas_box_stats(chart_candles, bot=bot)
+    except Exception as exc:
+        darvas_box_stats = {"valid": False, "reason": f"Could not load box data: {exc}"}
+
+render_sidebar_controls(bot, box_stats=darvas_box_stats if config.is_darvas_box_profile() else None)
 
 st.title("BTC/USDT ML Futures Desk")
 render_venue_banner()
@@ -995,7 +1107,12 @@ with right:
     render_closed_trades(trades_df, exchange_pos)
 
 st.subheader("Chart")
-render_tradingview(symbol="BINANCE:BTCUSDT.P", height=480)
+if config.is_darvas_box_profile():
+    render_darvas_price_chart(chart_candles, darvas_box_stats)
+    with st.expander("TradingView reference", expanded=False):
+        render_tradingview(symbol="BINANCE:BTCUSDT.P", height=420)
+else:
+    render_tradingview(symbol="BINANCE:BTCUSDT.P", height=480)
 
 with st.expander("Model thresholds & probabilities", expanded=False):
     render_threshold_circles(stats)

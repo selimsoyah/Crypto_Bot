@@ -7,8 +7,10 @@ import config
 
 
 def _darvas_breakout_frame(close: float) -> pd.DataFrame:
-    n = 30
-    ts = pd.date_range("2026-06-01", periods=n, freq="15min", tz="UTC")
+    prev = pd.date_range("2026-06-01 00:00", periods=96, freq="15min", tz="UTC")
+    curr = pd.date_range("2026-06-02 00:00", periods=10, freq="15min", tz="UTC")
+    ts = prev.append(curr)
+    n = len(ts)
     frame = pd.DataFrame(
         {
             "Timestamp": ts,
@@ -55,7 +57,12 @@ def test_darvas_profile_opens_long_on_breakout(bot, monkeypatch):
     bot._iteration()
     assert bot.state.position is not None
     assert bot.state.position.side == "LONG"
-    # Darvas LONG uses box bottom +/- buffer as SL and box-height RR for TP.
-    assert bot.state.position.stop_loss_price < bot.state.position.entry_price
-    assert bot.state.position.take_profit_price > bot.state.position.entry_price
-
+    assert bot._active_box is not None
+    assert bot._active_box.valid is True
+    assert bot._active_box.top == 110.0
+    assert bot._active_box.bottom == 90.0
+    assert bot._active_box.middle_line == 100.0
+    assert bot._active_box.breakout == "LONG"
+    # Box-height RR brackets are derived from previous-day boundaries, not the mocked ticker.
+    assert bot.state.position.take_profit_price > bot._active_box.top
+    assert bot.state.position.stop_loss_price < bot._active_box.bottom

@@ -779,3 +779,61 @@ def bot_health(
         "position_source": position_source,
         "detail": detail,
     }
+
+
+def darvas_box_stats(candles: pd.DataFrame | None, bot=None) -> dict:
+    """Return active Darvas box boundaries for dashboard display."""
+    empty = {
+        "valid": False,
+        "active_box_number": 0,
+        "box_top": 0.0,
+        "box_bottom": 0.0,
+        "middle_line": 0.0,
+        "box_height": 0.0,
+        "breakout": "CASH",
+        "prev_day": "",
+        "reason": "No box data available.",
+    }
+    if bot is not None:
+        box = getattr(bot, "_active_box", None)
+        if box is not None and getattr(box, "valid", False):
+            return {
+                "valid": True,
+                "active_box_number": int(getattr(box, "active_box_number", 0)),
+                "box_top": float(getattr(box, "top", 0.0)),
+                "box_bottom": float(getattr(box, "bottom", 0.0)),
+                "middle_line": float(getattr(box, "middle_line", 0.0)),
+                "box_height": float(getattr(box, "height", 0.0)),
+                "breakout": str(getattr(box, "breakout", "CASH")).upper(),
+                "prev_day": str(getattr(box, "prev_day", "")),
+                "reason": str(getattr(box, "reason", "")),
+            }
+
+    if candles is None or candles.empty:
+        return empty
+
+    from box_strategy import BoxStrategyEngine
+
+    engine = BoxStrategyEngine(
+        lookback_candles=config.BOX_LOOKBACK_CANDLES,
+        confirmation_candles=config.BOX_CONFIRMATION_CANDLES,
+        risk_to_reward_ratio=config.BOX_RISK_REWARD_RATIO,
+        volume_filter_multiplier=config.BOX_VOLUME_FILTER_MULTIPLIER,
+    )
+    state = engine.evaluate(candles)
+    if not state.valid:
+        empty["reason"] = state.reason
+        empty["active_box_number"] = state.active_box_number
+        return empty
+
+    return {
+        "valid": True,
+        "active_box_number": state.active_box_number,
+        "box_top": state.top,
+        "box_bottom": state.bottom,
+        "middle_line": state.middle_line,
+        "box_height": state.height,
+        "breakout": state.breakout,
+        "prev_day": state.prev_day,
+        "reason": state.reason,
+    }

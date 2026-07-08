@@ -500,9 +500,8 @@ def profile_summary() -> str:
     """One-line description of the active trading profile."""
     if is_darvas_box_profile():
         return (
-            f"Darvas Box mode — {INTERVAL} bars, lookback {BOX_LOOKBACK_CANDLES}, "
-            f"confirm {BOX_CONFIRMATION_CANDLES}, RR {BOX_RISK_REWARD_RATIO:.2f}, "
-            f"vol x{BOX_VOLUME_FILTER_MULTIPLIER:.2f}"
+            f"Darvas Box mode — {INTERVAL} bars, prev UTC day high/low anchor, "
+            f"RR {BOX_RISK_REWARD_RATIO:.2f}, vol x{BOX_VOLUME_FILTER_MULTIPLIER:.2f}"
         )
     if is_compound_profile():
         return (
