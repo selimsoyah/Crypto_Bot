@@ -225,7 +225,8 @@ class RiskEngine:
                 allowed=False,
                 reason=msg,
                 halt_new_orders=True,
-                event="WARNING",
+                flatten_positions=True,
+                event="STOP_LOSS",
             )
         return RiskDecision(allowed=True)
 

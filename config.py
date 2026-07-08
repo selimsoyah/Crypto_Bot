@@ -137,9 +137,9 @@ if is_compound_profile():
     STRUCTURE_LOOKBACK: Final[int] = int(_env("STRUCTURE_LOOKBACK", "96"))
     RETURN_LONG_LOOKBACK: Final[int] = int(_env("RETURN_LONG_LOOKBACK", "96"))
     # Scalp brackets — single source of truth for labels, backtest, and live execution.
-    # LONG: +0.40% TP / −0.25% SL · SHORT: −0.40% TP / +0.25% SL (symmetric triple-barrier).
-    TAKE_PROFIT_PCT: Final[float] = float(_env("TAKE_PROFIT_PCT", "0.004"))
-    STOP_LOSS_PCT: Final[float] = float(_env("STOP_LOSS_PCT", "0.0025"))
+    # LONG: +0.80% TP / −0.50% SL (1.6:1 R:R) · symmetric triple-barrier for shorts.
+    TAKE_PROFIT_PCT: Final[float] = float(_env("TAKE_PROFIT_PCT", "0.008"))
+    STOP_LOSS_PCT: Final[float] = float(_env("STOP_LOSS_PCT", "0.005"))
     HISTORICAL_PARQUET: Final[str] = str(
         BASE_DIR / _env("HISTORICAL_PARQUET", "historical_btc_15m.parquet")
     )
@@ -172,12 +172,27 @@ DIRECTION_NAMES: Final[dict[int, str]] = {
     LABEL_LONG: "LONG",
 }
 
-# Trend regime filter DISABLED ("uncaged" mode): the bot never sits in cash when
-# a directional edge exists, regardless of the EMA200 regime.
+# Legacy EMA200 regime filter (longs only above EMA200, shorts only below).
 USE_TREND_FILTER: Final[bool] = _env("USE_TREND_FILTER", "false").lower() in (
     "1",
     "true",
     "yes",
+)
+# Primary momentum gate on 15m bars: block longs below EMA50, shorts above EMA50.
+_EMA50_GATE_DEFAULT = "true" if is_compound_profile() else "false"
+USE_EMA50_TREND_GATE: Final[bool] = _env("USE_EMA50_TREND_GATE", _EMA50_GATE_DEFAULT).lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# Programmatic short inversion when long probability is very low (bearish conviction).
+ENABLE_LONG_INVERSION: Final[bool] = _env("ENABLE_LONG_INVERSION", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+LONG_INVERSION_THRESHOLD: Final[float] = float(
+    _env("LONG_INVERSION_THRESHOLD", "0.40")
 )
 
 # FALLBACK live execution thresholds (per direction). The live bot and the
@@ -247,6 +262,12 @@ TRAILING_STOP_DISTANCE_PCT: Final[float] = float(
 REENTRY_COOLDOWN_SECONDS: Final[int] = int(
     _env("REENTRY_COOLDOWN_SECONDS", "60" if is_compound_profile() else "0")
 )
+# After a stop-loss exit, block all new entries for N complete bars (4 × 15m = 1h).
+POST_SL_COOLDOWN_BARS: Final[int] = int(_env("POST_SL_COOLDOWN_BARS", "4"))
+# Emergency flatten uses market orders (not post-only) for circuit-breaker exits.
+CIRCUIT_BREAKER_USE_MARKET_FLATTEN: Final[bool] = _env(
+    "CIRCUIT_BREAKER_USE_MARKET_FLATTEN", "true"
+).lower() in ("1", "true", "yes")
 COMPOUND_WIN_STREAK_BOOST: Final[float] = float(_env("COMPOUND_WIN_STREAK_BOOST", "1.05"))
 COMPOUND_LOSS_STREAK_CUT: Final[float] = float(_env("COMPOUND_LOSS_STREAK_CUT", "0.90"))
 COMPOUND_MAX_SIZE_MULT: Final[float] = float(_env("COMPOUND_MAX_SIZE_MULT", "1.25"))
@@ -311,7 +332,7 @@ EXCHANGE_RECONNECT_THRESHOLD: Final[int] = int(_env("EXCHANGE_RECONNECT_THRESHOL
 # --------------------------------------------------------------------------- #
 # Live execution — audit-parity maker fills (COMPOUND / F2 audit alignment)   #
 # --------------------------------------------------------------------------- #
-# When true: fixed audit brackets (+0.4% / −0.25%), no ATR scaling, no
+# When true: fixed audit brackets (+0.8% / −0.5%), no ATR scaling, no
 # trailing stop, and FORWARD_WINDOW bar timeout exits (matches audit_predictions).
 _EXEC_AUDIT_DEFAULT = "true" if is_compound_profile() else "false"
 EXECUTION_AUDIT_PARITY: Final[bool] = _env(

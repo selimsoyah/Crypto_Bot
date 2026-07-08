@@ -9,8 +9,10 @@ import model_brain
 
 
 @pytest.fixture(autouse=True)
-def trend_filter_off(monkeypatch):
+def structural_gates_off(monkeypatch):
     monkeypatch.setattr(config, "USE_TREND_FILTER", False)
+    monkeypatch.setattr(config, "USE_EMA50_TREND_GATE", False)
+    monkeypatch.setattr(config, "ENABLE_LONG_INVERSION", False)
 
 
 def test_at_threshold_is_cash_not_trade():
@@ -74,3 +76,36 @@ def test_load_thresholds_from_sidecar(monkeypatch, tmp_path):
     long_thr, short_thr = model_brain.load_thresholds(path=str(path))
     assert long_thr == pytest.approx(0.475)
     assert short_thr == pytest.approx(0.600)
+
+
+def test_ema50_gate_blocks_long_below_ema(monkeypatch):
+    monkeypatch.setattr(config, "USE_EMA50_TREND_GATE", True)
+    monkeypatch.setattr(config, "ENABLE_LONG_INVERSION", False)
+    assert (
+        model_brain.decide_direction(
+            0.90, 0.05, 0.0, 0.40, 0.40, price_vs_ema50=-0.01
+        )
+        == "CASH"
+    )
+
+
+def test_ema50_gate_blocks_short_above_ema(monkeypatch):
+    monkeypatch.setattr(config, "USE_EMA50_TREND_GATE", True)
+    monkeypatch.setattr(config, "ENABLE_LONG_INVERSION", False)
+    assert (
+        model_brain.decide_direction(
+            0.05, 0.90, 0.0, 0.40, 0.40, price_vs_ema50=0.02
+        )
+        == "CASH"
+    )
+
+
+def test_long_inversion_maps_low_long_prob_to_short(monkeypatch):
+    monkeypatch.setattr(config, "ENABLE_LONG_INVERSION", True)
+    monkeypatch.setattr(config, "USE_EMA50_TREND_GATE", True)
+    assert (
+        model_brain.decide_direction(
+            0.30, 0.45, -0.05, 0.40, 0.40, price_vs_ema50=-0.02
+        )
+        == "SHORT"
+    )

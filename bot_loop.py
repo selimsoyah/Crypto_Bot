@@ -34,18 +34,25 @@ Run directly to start the bot in the foreground:
 On shutdown (Ctrl+C, SIGTERM, or dashboard FORCE SHUTDOWN) a
 ``session_summary_report.md`` performance dossier and a timestamped session CSV
 (``session_exports/session_{start}_{duration}.csv``) are written automatically.
+
+Session exports also run when the engine thread exits unexpectedly (``finally``
+in the trading loop), on process exit (``atexit``), and on the next dashboard
+boot if a prior session left an active-session marker on disk.
 """
 
 from __future__ import annotations
 
+import atexit
 import fcntl
+import json
 import os
 import signal
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import config
@@ -62,9 +69,12 @@ logger = config.configure_logging(__name__)
 
 SESSION_REPORT_PATH = "session_summary_report.md"
 INSTANCE_LOCK_PATH = str(config.BASE_DIR / ".bot_instance.lock")
+ACTIVE_SESSION_MARKER_PATH = str(config.BASE_DIR / ".bot_active_session.json")
 
 _REPORT_LOCK = threading.Lock()
 _REPORT_ALREADY_WRITTEN = False
+_ATEXIT_BOT_REF: Optional[weakref.ReferenceType["TradingBot"]] = None
+_ATEXIT_REGISTERED = False
 
 
 # --------------------------------------------------------------------------- #
@@ -482,6 +492,252 @@ def _write_session_artifacts(bot: "TradingBot", report: SessionReport) -> Option
 
 
 # --------------------------------------------------------------------------- #
+# Active-session marker + orphan export recovery                              #
+# --------------------------------------------------------------------------- #
+def _parse_session_ts(value: str) -> Optional[datetime]:
+    """Parse a session timestamp stored in SQLite or JSON."""
+    if not value:
+        return None
+    text = str(value).replace("+00:00", "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def infer_session_shutdown_ts(
+    store: TradeStore,
+    session_id: str,
+    *,
+    fallback: Optional[datetime] = None,
+) -> datetime:
+    """Best-effort session end time from the last status row for ``session_id``."""
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT ts FROM status_log WHERE session_id=? ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+    if row and row[0]:
+        parsed = _parse_session_ts(str(row[0]))
+        if parsed is not None:
+            return parsed
+    return fallback or datetime.now(timezone.utc)
+
+
+def _load_active_session_marker() -> Optional[dict[str, Any]]:
+    if not os.path.exists(ACTIVE_SESSION_MARKER_PATH):
+        return None
+    try:
+        with open(ACTIVE_SESSION_MARKER_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read active session marker: %s", exc)
+        return None
+
+
+def _write_active_session_marker(bot: "TradingBot") -> None:
+    if bot.session_id is None or bot._session_started_at is None:
+        return
+    started = bot._session_started_at
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    payload = {
+        "version": 1,
+        "session_id": bot.session_id,
+        "session_started_at": started.isoformat(),
+        "pid": os.getpid(),
+    }
+    tmp_path = f"{ACTIVE_SESSION_MARKER_PATH}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp_path, ACTIVE_SESSION_MARKER_PATH)
+    except OSError as exc:
+        logger.warning("Could not write active session marker: %s", exc)
+
+
+def _clear_active_session_marker() -> None:
+    try:
+        if os.path.exists(ACTIVE_SESSION_MARKER_PATH):
+            os.remove(ACTIVE_SESSION_MARKER_PATH)
+    except OSError as exc:
+        logger.warning("Could not remove active session marker: %s", exc)
+
+
+def _session_export_stamp_path(session_id: str) -> str:
+    export_dir = config.SESSION_EXPORT_DIR
+    os.makedirs(export_dir, exist_ok=True)
+    return os.path.join(export_dir, f".exported_{session_id}")
+
+
+def _session_already_exported(session_id: str) -> bool:
+    stamp = _session_export_stamp_path(session_id)
+    if os.path.exists(stamp):
+        return True
+    export_dir = config.SESSION_EXPORT_DIR
+    if not os.path.isdir(export_dir):
+        return False
+    # Heuristic: any CSV mentioning the session id in metrics is treated as exported.
+    for name in os.listdir(export_dir):
+        if not name.endswith(".csv"):
+            continue
+        path = os.path.join(export_dir, name)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                head = fh.read(4096)
+            if session_id in head:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _mark_session_exported(session_id: str) -> None:
+    try:
+        with open(_session_export_stamp_path(session_id), "w", encoding="utf-8") as fh:
+            fh.write(datetime.now(timezone.utc).isoformat())
+            fh.write("\n")
+    except OSError as exc:
+        logger.warning("Could not write session export stamp: %s", exc)
+
+
+def _recover_from_stale_instance_lock(store: TradeStore) -> Optional[SessionReport]:
+    """Fallback for crashes before the active-session marker existed."""
+    if os.path.exists(ACTIVE_SESSION_MARKER_PATH):
+        return None
+    if not os.path.exists(INSTANCE_LOCK_PATH):
+        return None
+    try:
+        lock_pid = int(
+            str(open(INSTANCE_LOCK_PATH, encoding="utf-8").read()).strip() or "0"
+        )
+    except (OSError, ValueError):
+        lock_pid = 0
+    if lock_pid > 0:
+        try:
+            os.kill(lock_pid, 0)
+            return None
+        except OSError:
+            pass
+
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT session_id FROM status_log ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        started_row = None
+        if row and row[0]:
+            started_row = conn.execute(
+                "SELECT ts FROM status_log WHERE session_id=? ORDER BY id ASC LIMIT 1",
+                (row[0],),
+            ).fetchone()
+    if not row or not row[0]:
+        return None
+    session_id = str(row[0])
+    if _session_already_exported(session_id):
+        return None
+
+    started_at = (
+        _parse_session_ts(str(started_row[0]))
+        if started_row and started_row[0]
+        else None
+    )
+    if started_at is None:
+        return None
+
+    shutdown_ts = infer_session_shutdown_ts(store, session_id, fallback=started_at)
+    global _REPORT_ALREADY_WRITTEN
+    _REPORT_ALREADY_WRITTEN = False
+    bot = TradingBot(store=store, _skip_session_recovery=True)
+    bot.session_id = session_id
+    bot._session_started_at = started_at
+    logger.warning(
+        "Stale engine lock detected — recovering session %s (last scan %s UTC).",
+        session_id,
+        shutdown_ts.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    report = generate_session_summary_report(bot, shutdown_ts=shutdown_ts)
+    if report is not None:
+        _mark_session_exported(session_id)
+        _clear_active_session_marker()
+    return report
+
+
+def recover_orphan_session_export(store: TradeStore) -> Optional[SessionReport]:
+    """Export a crashed session using the on-disk marker + SQLite ground truth."""
+    marker = _load_active_session_marker()
+    if marker:
+        session_id = str(marker.get("session_id") or "").strip()
+        started_raw = marker.get("session_started_at")
+        if not session_id or not started_raw:
+            logger.warning("Active session marker is invalid — removing.")
+            _clear_active_session_marker()
+            return None
+
+        started_at = _parse_session_ts(str(started_raw))
+        if started_at is None:
+            logger.warning("Active session marker has bad timestamp — removing.")
+            _clear_active_session_marker()
+            return None
+
+        shutdown_ts = infer_session_shutdown_ts(store, session_id, fallback=started_at)
+        global _REPORT_ALREADY_WRITTEN
+        _REPORT_ALREADY_WRITTEN = False
+        bot = TradingBot(store=store, _skip_session_recovery=True)
+        bot.session_id = session_id
+        bot._session_started_at = started_at
+        logger.warning(
+            "Recovering orphaned session %s (last scan %s UTC) — writing export.",
+            session_id,
+            shutdown_ts.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        report = generate_session_summary_report(bot, shutdown_ts=shutdown_ts)
+        if report is not None:
+            _mark_session_exported(session_id)
+            _clear_active_session_marker()
+            logger.info(
+                "Recovered session export for %s -> %s",
+                session_id,
+                report.csv_path or SESSION_REPORT_PATH,
+            )
+        return report
+
+    return _recover_from_stale_instance_lock(store)
+
+
+def _register_process_shutdown_hook(bot: "TradingBot") -> None:
+    """Ensure SIGTERM / normal process exit attempts a session export once."""
+    global _ATEXIT_BOT_REF, _ATEXIT_REGISTERED
+
+    _ATEXIT_BOT_REF = weakref.ref(bot)
+
+    def _on_process_exit() -> None:
+        live = _ATEXIT_BOT_REF() if _ATEXIT_BOT_REF is not None else None
+        if live is None:
+            return
+        if live.session_id is None or live._session_started_at is None:
+            return
+        if not os.path.exists(ACTIVE_SESSION_MARKER_PATH):
+            return
+        logger.info("Process exit hook — finalizing active session export.")
+        live._stop_event.set()
+        live._finalize_session_shutdown()
+
+    if not _ATEXIT_REGISTERED:
+        atexit.register(_on_process_exit)
+        _ATEXIT_REGISTERED = True
+
+
+# --------------------------------------------------------------------------- #
 # Runtime state                                                               #
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -528,7 +784,12 @@ class BotState:
 class TradingBot:
     """Encapsulates the live trading loop and the dual-direction engine."""
 
-    def __init__(self, store: Optional[TradeStore] = None) -> None:
+    def __init__(
+        self,
+        store: Optional[TradeStore] = None,
+        *,
+        _skip_session_recovery: bool = False,
+    ) -> None:
         self.state = BotState()
         self.store = store or TradeStore()
         self.session_id: Optional[str] = None
@@ -558,6 +819,10 @@ class TradingBot:
         self._last_known_total_wallet: float = 0.0
         self._last_close_at: Optional[datetime] = None
         self._bracket_closed_this_iteration: bool = False
+        self._post_sl_cooldown_until: Optional[datetime] = None
+        self._session_armed: bool = False
+        if not _skip_session_recovery:
+            recover_orphan_session_export(self.store)
 
     # ------------------------------------------------------------------ #
     # Setup helpers                                                      #
@@ -742,10 +1007,90 @@ class TradingBot:
             return (price - pos.entry_price) * pos.quantity
         return (pos.entry_price - price) * pos.quantity
 
+    def _post_sl_entry_blocked(self) -> tuple[bool, str]:
+        """Return whether the post-stop-loss bar cooldown is still active."""
+        if self._post_sl_cooldown_until is None:
+            return False, ""
+        now = datetime.now(timezone.utc)
+        if now >= self._post_sl_cooldown_until:
+            self._post_sl_cooldown_until = None
+            return False, ""
+        remaining = int((self._post_sl_cooldown_until - now).total_seconds())
+        bars = config.POST_SL_COOLDOWN_BARS
+        return (
+            True,
+            f"Post-SL cooldown — waiting {remaining}s ({bars}×{config.INTERVAL} bars) "
+            f"before evaluating new entries.",
+        )
+
+    def _arm_post_sl_cooldown(self) -> None:
+        seconds = compound_strategy.post_sl_cooldown_seconds()
+        self._post_sl_cooldown_until = datetime.now(timezone.utc) + timedelta(
+            seconds=seconds
+        )
+        logger.info(
+            "Post-SL cooldown armed for %ds (%d bars).",
+            seconds,
+            config.POST_SL_COOLDOWN_BARS,
+        )
+
+    def _flatten_exchange_orphans(self, price: float, *, context: str = "") -> bool:
+        """Market-close any open position on the exchange (in-memory may be FLAT)."""
+        if self._client is None:
+            return False
+        try:
+            snap = order_execution.fetch_open_position(self._client, config.SYMBOL)
+        except Exception as exc:
+            logger.error(
+                "Exchange position read failed during flatten: %s",
+                config.sanitize_for_log(str(exc)),
+            )
+            return False
+        if snap["side"] == "FLAT" or snap["quantity"] <= 0:
+            return False
+        qty = self._round_step(snap["quantity"])
+        if qty <= 0:
+            qty = snap["quantity"]
+        try:
+            order_execution.flatten_position_market(
+                self._client,
+                symbol=config.SYMBOL,
+                quantity=qty,
+                position_side=snap["side"],
+            )
+        except Exception as exc:
+            logger.error(
+                "Emergency flatten failed: %s",
+                config.sanitize_for_log(str(exc)),
+            )
+            send_alert(
+                "CRITICAL",
+                "Flatten failed",
+                f"{context}: {exc}",
+                key="flatten_failed",
+            )
+            return False
+        note = context or "Risk circuit breaker"
+        logger.warning(
+            "%s — market-flattened exchange %s qty=%s",
+            note,
+            snap["side"],
+            qty,
+        )
+        send_alert(
+            "CRITICAL",
+            "Position flattened",
+            f"{note}: closed {snap['side']} qty {qty} @ ~${price:,.2f}",
+            key="position_flattened",
+        )
+        return True
+
     def _apply_risk_decision(self, decision: RiskDecision, price: float) -> None:
         """Flatten (if required), log halt reason, optionally stop the loop."""
-        if decision.flatten_positions and self.state.position is not None:
-            self._close_position(price, reason_code="MANUAL")
+        if decision.flatten_positions:
+            if self.state.position is not None:
+                self._close_position(price, reason_code="MANUAL", force_market=True)
+            self._flatten_exchange_orphans(price, context=decision.reason or "Risk halt")
         if decision.reason:
             self._set_reason(decision.event, "RISK_HALT", decision.reason)
             logger.warning(decision.reason)
@@ -757,7 +1102,9 @@ class TradingBot:
                     key="risk_halt",
                 )
         if decision.flatten_positions and (
-            self.risk.state.kill_switch_active or "SESSION LOSS LIMIT" in decision.reason
+            self.risk.state.kill_switch_active
+            or "SESSION LOSS LIMIT" in (decision.reason or "")
+            or "CONSECUTIVE LOSS LIMIT" in (decision.reason or "")
         ):
             self._stop_event.set()
 
@@ -767,7 +1114,9 @@ class TradingBot:
         send_alert("CRITICAL", "Kill switch", reason, key="kill_switch")
         price = self.state.last_price
         if self.state.position is not None and price > 0:
-            self._close_position(price, reason_code="MANUAL")
+            self._close_position(price, reason_code="MANUAL", force_market=True)
+        elif price > 0:
+            self._flatten_exchange_orphans(price, context=reason)
         self._stop_event.set()
 
     def confirm_risk_resume(self) -> str:
@@ -872,6 +1221,12 @@ class TradingBot:
         book: Optional[order_execution.BookTicker] = None,
     ) -> None:
         """Open a LONG or SHORT with volatility-aware margin from the risk engine."""
+        blocked, block_reason = self._post_sl_entry_blocked()
+        if blocked:
+            self._set_reason("CASH", f"BLOCKED_{direction}", block_reason)
+            logger.warning(block_reason)
+            return
+
         gate = self.risk.check_can_open()
         if not gate.allowed:
             self._set_reason(gate.event, f"BLOCKED_{direction}", gate.reason)
@@ -1070,6 +1425,7 @@ class TradingBot:
         reason_code: str,
         *,
         book: Optional[order_execution.BookTicker] = None,
+        force_market: bool = False,
     ) -> None:
         """Close the open position with a reduce-only post-only limit order.
 
@@ -1087,7 +1443,9 @@ class TradingBot:
         if quantity <= 0:
             quantity = pos.quantity
 
-        if config.USE_POST_ONLY_MAKER:
+        use_maker = config.USE_POST_ONLY_MAKER and not force_market
+
+        if use_maker:
             order_result = self._execute_maker_limit(
                 side, quantity, reduce_only=True, book=book
             )
@@ -1177,6 +1535,8 @@ class TradingBot:
             self.state.last_event = event
             self.state.last_reason = reason
         logger.info(reason)
+        if reason_code == "SL":
+            self._arm_post_sl_cooldown()
         if reason_code != "FLIP":
             self._last_close_at = datetime.now(timezone.utc)
         if reason_code in ("TP", "SL", "TIMEOUT"):
@@ -1203,6 +1563,15 @@ class TradingBot:
         if not pause.allowed:
             self._set_reason(pause.event, "RISK_HALT", pause.reason)
             logger.warning(pause.reason)
+            if pause.flatten_positions:
+                self._flatten_exchange_orphans(fill_price, context=pause.reason)
+                send_alert(
+                    "CRITICAL",
+                    "Consecutive-loss circuit breaker",
+                    pause.reason,
+                    key="consecutive_loss_halt",
+                )
+                self._stop_event.set()
         send_alert(
             "INFO",
             f"Closed {pos.side} ({reason_code})",
@@ -1331,6 +1700,8 @@ class TradingBot:
             signal["trend"],
             self._long_threshold,
             self._short_threshold,
+            price_vs_ema50=signal.get("price_vs_ema50", 0.0),
+            prob_cash=signal.get("prob_cash"),
         )
         self._log_directional_signal(signal, direction)
 
@@ -1396,7 +1767,10 @@ class TradingBot:
                         pos = None
 
         # --- Directional entry / flip logic ------------------------------ #
-        if self._bracket_closed_this_iteration:
+        post_sl_blocked, post_sl_reason = self._post_sl_entry_blocked()
+        if post_sl_blocked and self.state.position is None:
+            self._set_reason("CASH", "HOLD", post_sl_reason)
+        elif self._bracket_closed_this_iteration:
             pass
         elif direction == "LONG":
             if pos is not None and pos.side == "SHORT":
@@ -1497,69 +1871,101 @@ class TradingBot:
 
     def _run(self) -> None:
         try:
-            self._connect()
-            self._load_model()
-        except Exception as exc:
-            self.state.last_error = str(exc)
-            self.state.running = False
-            reason = (
-                f"Engine startup FAILED: {exc}. Check API credentials, network, "
-                f"and that the model artifact exists."
-            )
-            self._set_reason("WARNING", "STARTUP_FAILED", reason)
-            self._log_status(self.state.last_price or 0.0)
-            logger.error(reason)
-            self._instance_lock.release()
-            return
-
-        self.state.running = True
-        self._session_started_at = datetime.now(timezone.utc)
-        start_equity = self._get_total_wallet_balance()
-        self.risk.begin_session(start_equity)
-        if self.risk.kill_switch_file_active():
-            msg = (
-                f"Kill switch file present ({config.KILL_SWITCH_FILE}). "
-                "Remove it or call clear_kill_switch() before trading."
-            )
-            self.state.last_error = msg
-            self.state.running = False
-            logger.error(msg)
-            self._instance_lock.release()
-            return
-        logger.info(
-            "Trading loop started (interval=%ss, session=%s).",
-            config.LOOP_SLEEP_SECONDS,
-            self.session_id,
-        )
-        self._write_boot_status()
-        while not self._stop_event.is_set():
             try:
-                self._iteration()
-            except Exception as exc:  # keep the loop alive on transient errors
-                safe = config.sanitize_for_log(str(exc))
-                self.state.last_error = safe
-                logger.error("Iteration error: %s", safe)
-                self._log_iteration_error(safe)
-                send_alert(
-                    "ERROR",
-                    "Iteration error",
-                    safe,
-                    key="iteration_error",
+                self._connect()
+                self._load_model()
+            except Exception as exc:
+                self.state.last_error = str(exc)
+                self.state.running = False
+                reason = (
+                    f"Engine startup FAILED: {exc}. Check API credentials, network, "
+                    f"and that the model artifact exists."
                 )
-            self._stop_event.wait(config.LOOP_SLEEP_SECONDS)
+                self._set_reason("WARNING", "STARTUP_FAILED", reason)
+                self._log_status(self.state.last_price or 0.0)
+                logger.error(reason)
+                self._instance_lock.release()
+                return
 
-        self.state.running = False
-        logger.info("Trading loop stopped.")
+            self.state.running = True
+            self._session_started_at = datetime.now(timezone.utc)
+            start_equity = self._get_total_wallet_balance()
+            self.risk.begin_session(start_equity)
+            if self.risk.kill_switch_file_active():
+                msg = (
+                    f"Kill switch file present ({config.KILL_SWITCH_FILE}). "
+                    "Remove it or call clear_kill_switch() before trading."
+                )
+                self.state.last_error = msg
+                self.state.running = False
+                logger.error(msg)
+                self._instance_lock.release()
+                return
+            self._session_armed = True
+            _write_active_session_marker(self)
+            _register_process_shutdown_hook(self)
+            logger.info(
+                "Trading loop started (interval=%ss, session=%s).",
+                config.LOOP_SLEEP_SECONDS,
+                self.session_id,
+            )
+            self._write_boot_status()
+            while not self._stop_event.is_set():
+                try:
+                    self._iteration()
+                except Exception as exc:  # keep the loop alive on transient errors
+                    safe = config.sanitize_for_log(str(exc))
+                    self.state.last_error = safe
+                    logger.error("Iteration error: %s", safe)
+                    self._log_iteration_error(safe)
+                    send_alert(
+                        "ERROR",
+                        "Iteration error",
+                        safe,
+                        key="iteration_error",
+                    )
+                self._stop_event.wait(config.LOOP_SLEEP_SECONDS)
+        finally:
+            self.state.running = False
+            if self._session_armed:
+                logger.info("Trading loop exited — finalizing session export.")
+                self._finalize_session_shutdown(
+                    shutdown_ts=infer_session_shutdown_ts(
+                        self.store,
+                        self.session_id or "",
+                    )
+                )
+                self._session_armed = False
+            else:
+                logger.info("Trading loop stopped.")
 
     # ------------------------------------------------------------------ #
     # Public control API                                                 #
     # ------------------------------------------------------------------ #
+    def _finalize_session_shutdown(
+        self,
+        shutdown_ts: Optional[datetime] = None,
+    ) -> Optional[SessionReport]:
+        """Write session markdown + CSV once for the current session."""
+        if self.session_id is None or self._session_started_at is None:
+            return None
+        end_ts = shutdown_ts or infer_session_shutdown_ts(
+            self.store,
+            self.session_id,
+        )
+        report = generate_session_summary_report(self, shutdown_ts=end_ts)
+        if report is not None:
+            _mark_session_exported(self.session_id)
+            _clear_active_session_marker()
+        return report
+
     def start(self) -> bool:
         """Start the engine. Returns False if another instance holds the lock."""
         global _REPORT_ALREADY_WRITTEN
         if self._thread and self._thread.is_alive():
             logger.info("Bot already running.")
             return True
+        recover_orphan_session_export(self.store)
         if not self._instance_lock.acquire():
             msg = (
                 "Another bot engine instance is already running on this machine "
@@ -1598,7 +2004,7 @@ class TradingBot:
         if self._thread:
             self._thread.join(timeout=config.LOOP_SLEEP_SECONDS + 5)
         self._instance_lock.release()
-        return generate_session_summary_report(self)
+        return self._finalize_session_shutdown()
 
 
 def _register_signal_handlers() -> None:

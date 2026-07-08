@@ -154,19 +154,50 @@ def decide_direction(
     long_threshold: float,
     short_threshold: float,
     use_trend_filter: Optional[bool] = None,
+    *,
+    price_vs_ema50: float = 0.0,
+    use_ema50_gate: Optional[bool] = None,
+    prob_cash: Optional[float] = None,
 ) -> str:
     """Return ``"LONG"``, ``"SHORT"`` or ``"CASH"`` for a single observation.
 
-    Applies the per-direction probability thresholds and, when enabled, the
-    EMA200 regime filter (longs only above EMA200, shorts only below). When both
-    directions qualify, the higher-probability side wins.
+    Applies per-direction probability thresholds, optional EMA200 regime filter,
+    EMA50 momentum gate, and long-probability inversion for bearish conviction.
 
     ``use_trend_filter`` overrides ``config.USE_TREND_FILTER`` when set (used by
     the Phase 1 trend-filter A/B backtest).
     """
     trend_on = config.USE_TREND_FILTER if use_trend_filter is None else use_trend_filter
-    allow_long = prob_long > long_threshold and (not trend_on or trend > 0)
-    allow_short = prob_short > short_threshold and (not trend_on or trend < 0)
+    ema50_on = (
+        config.USE_EMA50_TREND_GATE if use_ema50_gate is None else use_ema50_gate
+    )
+    p_cash = (
+        prob_cash
+        if prob_cash is not None
+        else max(0.0, 1.0 - prob_long - prob_short)
+    )
+
+    # Programmatic inversion: very low long probability + bearish mass → SHORT.
+    if (
+        config.ENABLE_LONG_INVERSION
+        and prob_long < config.LONG_INVERSION_THRESHOLD
+        and prob_short >= p_cash
+    ):
+        if not ema50_on or price_vs_ema50 < 0:
+            if not trend_on or trend < 0:
+                return "SHORT"
+
+    allow_long = prob_long > long_threshold
+    allow_short = prob_short > short_threshold
+
+    if trend_on:
+        allow_long = allow_long and trend > 0
+        allow_short = allow_short and trend < 0
+
+    if ema50_on:
+        allow_long = allow_long and price_vs_ema50 > 0
+        allow_short = allow_short and price_vs_ema50 < 0
+
     if allow_long and allow_short:
         return "LONG" if prob_long >= prob_short else "SHORT"
     if allow_long:
@@ -737,8 +768,8 @@ def predict_latest(model, candles: pd.DataFrame) -> dict[str, float]:
 
     ``candles`` is a raw OHLCV frame (e.g. from
     ``data_pipeline.fetch_latest_candles``). The returned dict contains
-    ``prob_long``, ``prob_short``, ``prob_cash`` and ``trend``
-    (the ``price_vs_ema200`` value of the latest candle).
+    ``prob_long``, ``prob_short``, ``prob_cash``, ``trend`` (EMA200 distance),
+    and ``price_vs_ema50`` for the live momentum gate.
     """
     enriched = compute_live_features(candles, feature_variant=config.FEATURE_VARIANT)
     cols = feature_columns_for(config.FEATURE_VARIANT)
@@ -748,11 +779,20 @@ def predict_latest(model, candles: pd.DataFrame) -> dict[str, float]:
     latest = feature_rows.iloc[[-1]]
     proba = model.predict_proba(latest)[0]
     trend = float(latest["price_vs_ema200"].iloc[0]) if "price_vs_ema200" in latest else 0.0
+    if "price_vs_ema50" in enriched.columns:
+        price_vs_ema50 = float(enriched["price_vs_ema50"].iloc[-1])
+    elif "ema_50" in enriched.columns:
+        close = float(enriched["Close"].iloc[-1])
+        ema50 = float(enriched["ema_50"].iloc[-1])
+        price_vs_ema50 = (close - ema50) / ema50 if ema50 else 0.0
+    else:
+        price_vs_ema50 = 0.0
     return {
         "prob_long": float(proba[config.LABEL_LONG]),
         "prob_short": float(proba[config.LABEL_SHORT]),
         "prob_cash": float(proba[config.LABEL_CASH]),
         "trend": trend,
+        "price_vs_ema50": price_vs_ema50,
     }
 
 

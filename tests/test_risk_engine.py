@@ -50,6 +50,7 @@ def test_consecutive_losses_pause_until_manual_resume(engine, tmp_path):
     d = engine.record_trade_close(-10.0)
     assert d.allowed is False
     assert d.halt_new_orders is True
+    assert d.flatten_positions is True
     assert engine.snapshot().manual_resume_required is True
     assert os.path.exists(config.RISK_MANUAL_RESUME_FILE)
 

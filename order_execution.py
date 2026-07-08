@@ -299,3 +299,43 @@ def place_and_wait_post_only(
         poll_interval_sec=poll,
         fallback_price=limit_price,
     )
+
+
+def fetch_open_position(client, symbol: str) -> dict[str, float]:
+    """Return exchange position snapshot: side (LONG/SHORT/FLAT), qty, entry."""
+    rows = exchange_client.call_with_retry(
+        client.futures_position_information,
+        symbol=symbol,
+        label="futures_position_information",
+    )
+    if not rows:
+        return {"side": "FLAT", "quantity": 0.0, "entry_price": 0.0}
+    row = rows[0]
+    amt = float(row.get("positionAmt", 0.0) or 0.0)
+    if abs(amt) < 1e-12:
+        return {"side": "FLAT", "quantity": 0.0, "entry_price": 0.0}
+    side = "LONG" if amt > 0 else "SHORT"
+    entry = float(row.get("entryPrice", 0.0) or 0.0)
+    return {"side": side, "quantity": abs(amt), "entry_price": entry}
+
+
+def flatten_position_market(
+    client,
+    *,
+    symbol: str,
+    quantity: float,
+    position_side: str,
+) -> dict[str, Any]:
+    """Market-close an open futures position (reduce-only)."""
+    if quantity <= 0:
+        return {}
+    close_side = "SELL" if position_side.upper() == "LONG" else "BUY"
+    return exchange_client.call_with_retry(
+        client.futures_create_order,
+        symbol=symbol,
+        side=close_side,
+        type="MARKET",
+        quantity=quantity,
+        reduceOnly=True,
+        label="futures_flatten_market",
+    )

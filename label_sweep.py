@@ -48,10 +48,11 @@ class LabelVariant:
 
 
 VARIANTS: Final[tuple[LabelVariant, ...]] = (
-    LabelVariant("L1", "Current control", 16, 0.004, 0.0025),
-    LabelVariant("L2", "Shorter horizon (12 bars)", 12, 0.004, 0.0025),
-    LabelVariant("L3", "Longer horizon (24 bars)", 24, 0.004, 0.0025),
-    LabelVariant("L4", "Wider brackets (+0.8% / -0.4%)", 16, 0.008, 0.004),
+    LabelVariant("L1", "Current control (+0.8% / -0.5%)", 16, 0.008, 0.005),
+    LabelVariant("L2", "Shorter horizon (12 bars)", 12, 0.008, 0.005),
+    LabelVariant("L3", "Longer horizon (24 bars)", 24, 0.008, 0.005),
+    LabelVariant("L4", "Legacy tight brackets (+0.4% / -0.25%)", 16, 0.004, 0.0025),
+    LabelVariant("L5", "Wide brackets (+1.0% / -0.5%)", 16, 0.010, 0.005),
 )
 
 

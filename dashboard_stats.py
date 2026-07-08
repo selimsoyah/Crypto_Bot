@@ -18,6 +18,152 @@ import config
 import exchange_client
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def reconcile_manual_exchange_close(
+    *,
+    store,
+    log: pd.DataFrame,
+    trades: pd.DataFrame,
+    exchange_pos: Optional[dict] = None,
+    symbol: str = config.SYMBOL,
+    client=None,
+) -> dict:
+    """Backfill manual exchange closes into ``trades`` so stats stay accurate.
+
+    This handles the common orphan case: status log still shows LONG/SHORT while
+    the exchange is already flat because the operator manually closed in Binance.
+    """
+    result = {"inserted": False, "message": ""}
+    if log.empty:
+        return result
+    if not exchange_pos or exchange_pos.get("status") != "flat":
+        return result
+
+    last = log.iloc[-1]
+    side = str(last.get("Open_Position", "FLAT") or "FLAT").upper()
+    if side not in ("LONG", "SHORT"):
+        return result
+
+    session_id = str(last.get("Session_Id", "") or "")
+    entry_ts = str(last.get("Timestamp", "") or "")
+    if not session_id or not entry_ts:
+        return result
+
+    # One close per entry. If present, reconciliation already happened.
+    if not trades.empty:
+        dup = trades[
+            (trades["session_id"].astype(str) == session_id)
+            & (trades["side"].astype(str).str.upper() == side)
+            & (trades["entry_ts"].astype(str) == entry_ts)
+        ]
+        if not dup.empty:
+            return result
+
+    if client is None:
+        client = exchange_client.build_execution_client()
+    try:
+        fills = exchange_client.call_with_retry(
+            client.futures_account_trades,
+            symbol=symbol,
+            limit=200,
+            label="futures_account_trades",
+        )
+    except Exception as exc:
+        result["message"] = f"Manual close reconciliation failed: {config.sanitize_for_log(str(exc))}"
+        return result
+
+    close_side = "SELL" if side == "LONG" else "BUY"
+    entry_dt = pd.to_datetime(entry_ts, errors="coerce", utc=True)
+    if pd.isna(entry_dt):
+        return result
+    entry_ms = int(entry_dt.timestamp() * 1000)
+    close_fills = [
+        f
+        for f in fills
+        if str(f.get("side", "")).upper() == close_side
+        and int(_safe_float(f.get("time"), 0)) >= entry_ms
+        and _safe_float(f.get("qty"), 0.0) > 0.0
+    ]
+    if not close_fills:
+        return result
+
+    # Pick the latest closing order and aggregate its child fills.
+    latest = max(close_fills, key=lambda x: int(_safe_float(x.get("time"), 0)))
+    latest_order_id = str(latest.get("orderId", ""))
+    order_fills = [
+        f for f in close_fills if str(f.get("orderId", "")) == latest_order_id
+    ] or [latest]
+
+    qty = sum(_safe_float(f.get("qty"), 0.0) for f in order_fills)
+    if qty <= 0:
+        return result
+    quote = sum(
+        _safe_float(f.get("price"), 0.0) * _safe_float(f.get("qty"), 0.0)
+        for f in order_fills
+    )
+    exit_price = quote / qty if quote > 0 else _safe_float(last.get("Current_Price"), 0.0)
+    realized = sum(_safe_float(f.get("realizedPnl"), 0.0) for f in order_fills)
+    exit_ms = max(int(_safe_float(f.get("time"), 0)) for f in order_fills)
+    exit_ts = datetime.fromtimestamp(exit_ms / 1000, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    from trade_store import StatusRow, TradeRecord
+
+    trade = TradeRecord(
+        session_id=session_id,
+        side=side,
+        entry_ts=entry_ts,
+        exit_ts=exit_ts,
+        entry_price=_safe_float(last.get("Entry_Price"), 0.0),
+        exit_price=exit_price,
+        quantity=qty,
+        tp_price=_safe_float(last.get("TP_Price"), 0.0),
+        sl_price=_safe_float(last.get("SL_Price"), 0.0),
+        peak_unrealized=abs(_safe_float(last.get("Unrealized_PNL"), 0.0)),
+        realized_pnl=realized,
+        outcome="MANUAL",
+    )
+    store.record_trade(trade)
+
+    # Write a matching terminal row so activity feed and state don't stay stale.
+    status = StatusRow(
+        ts=exit_ts,
+        session_id=session_id,
+        price=exit_price,
+        prob_long=_safe_float(last.get("Prob_Long"), 0.0),
+        prob_short=_safe_float(last.get("Prob_Short"), 0.0),
+        prob_cash=_safe_float(last.get("Prob_Cash"), 0.0),
+        direction=str(last.get("Direction", "CASH") or "CASH"),
+        balance=_safe_float(last.get("Current_Balance"), 0.0),
+        open_position="FLAT",
+        realized_pnl=_safe_float(last.get("Realized_PNL"), 0.0) + realized,
+        unrealized_pnl=0.0,
+        entry_price=None,
+        tp_price=None,
+        sl_price=None,
+        action=f"CLOSE_{side}_MANUAL",
+        event="FILL_SUCCESS" if realized >= 0 else "STOP_LOSS",
+        reason=(
+            f"Manual exchange close detected ({close_side}) and reconciled into "
+            f"dashboard ledger at ${exit_price:,.2f}."
+        ),
+    )
+    store.log_status(status)
+    result["inserted"] = True
+    result["message"] = (
+        f"Reconciled manual close: {side} {qty:.4f} @ ${exit_price:,.2f} "
+        f"(PnL {realized:+.2f})."
+    )
+    return result
+
+
 def count_profitable_wins(trades: pd.DataFrame) -> int:
     """Count wins: explicit TP **or** any close with positive realized PnL."""
     if trades.empty:

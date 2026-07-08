@@ -284,6 +284,21 @@ def _phase3_groups_for_variant(variant: str) -> set[str]:
 # --------------------------------------------------------------------------- #
 # Feature assembly                                                            #
 # --------------------------------------------------------------------------- #
+def _apply_symmetric_momentum_features(out: pd.DataFrame) -> pd.DataFrame:
+    """Z-score / centre symmetric transforms so bearish structures mirror bullish ones.
+
+    RSI is mapped to roughly [-2, +2] around neutral 50. MACD family and return
+    features use rolling z-scores so plunging and rising regimes are comparable.
+    """
+    window = REGIME_ROLL_BARS
+    out["rsi_14"] = (out["rsi_14"] - 50.0) / 25.0
+    for col in ("macd", "macd_signal", "macd_hist"):
+        out[col] = _rolling_zscore(out[col], window)
+    for col in ("return_1h", "return_24h", "volume_change"):
+        out[col] = _rolling_zscore(out[col], window)
+    return out
+
+
 def add_technical_indicators(
     df: pd.DataFrame,
     *,
@@ -335,6 +350,9 @@ def add_technical_indicators(
     out["return_1h"] = close.pct_change(1)
     out["return_24h"] = close.pct_change(config.RETURN_LONG_LOOKBACK)
     out["volume_change"] = volume.pct_change(1).replace([np.inf, -np.inf], np.nan)
+    out["price_vs_ema50"] = (close - out["ema_50"]) / out["ema_50"].replace(0.0, np.nan)
+
+    out = _apply_symmetric_momentum_features(out)
 
     groups = _phase3_groups_for_variant(feature_variant)
     if "regime" in groups:
@@ -365,6 +383,9 @@ def build_target(
     * ``LABEL_SHORT`` (1): the low reaches ``entry * (1 - take_profit)`` strictly
       before the high breaches ``entry * (1 + stop_loss)``.
     * ``LABEL_CASH`` (0): neither directional setup triggers within the window.
+
+    This is a **3-class** target (not binary): long wins, short wins, and flat are
+    mutually exclusive per candle.
 
     ``take_profit`` and ``stop_loss`` default to ``config.TAKE_PROFIT_PCT`` and
     ``config.STOP_LOSS_PCT`` at **call** time — the exact values the live bot

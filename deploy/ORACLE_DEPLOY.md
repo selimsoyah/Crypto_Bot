@@ -263,7 +263,10 @@ scp -i ~/Downloads/oracle_key.pem ubuntu@YOUR_PUBLIC_IP:~/Crypto_Bot/session_exp
 
 | Task                         | Command                                                                                              |
 | ---------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Open dashboard from PC       | `bash deploy/scripts/open_dashboard.sh ubuntu@IP`                                                    |
+| **Open PC — full session**   | `SSH_KEY=~/oracle-key.key bash deploy/scripts/startup_session.sh ubuntu@IP`                        |
+| Close dashboard tunnel       | `bash deploy/scripts/stop_session.sh`                                                                |
+| **Before powering off PC**   | `SSH_KEY=~/oracle-key.key bash deploy/scripts/preflight_shutdown.sh ubuntu@IP`                     |
+| Open dashboard only (tunnel) | `bash deploy/scripts/open_dashboard.sh ubuntu@IP`                                                    |
 | Dashboard status (on server) | `sudo systemctl status crypto-bot-dashboard`                                                         |
 | Restart dashboard            | `sudo systemctl restart crypto-bot-dashboard`                                                        |
 | View dashboard logs          | `journalctl -u crypto-bot-dashboard -f`                                                              |

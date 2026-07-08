@@ -5,6 +5,7 @@ import pytest
 
 import config
 import dashboard_stats
+from trade_store import StatusRow, TradeStore
 
 
 def _log_row(**kwargs) -> dict:
@@ -245,3 +246,71 @@ def test_bot_health_booting_when_running_without_log(bot):
     h = dashboard_stats.bot_health(bot, pd.DataFrame())
     assert h["status"] == "BOOTING"
     assert h["stale"] is False
+
+
+def test_reconcile_manual_exchange_close_backfills_trade(tmp_path):
+    store = TradeStore(db_path=str(tmp_path / "dashboard.db"))
+    store.log_status(
+        StatusRow(
+            ts="2026-07-08 10:00:00",
+            session_id="sess-manual",
+            price=63_700.0,
+            prob_long=0.62,
+            prob_short=0.22,
+            prob_cash=0.16,
+            direction="LONG",
+            balance=5_000.0,
+            open_position="LONG",
+            realized_pnl=-9.48,
+            unrealized_pnl=9.64,
+            entry_price=63_761.89,
+            tp_price=64_272.00,
+            sl_price=63_443.00,
+            action="HOLD",
+            event="WAIT",
+            reason="stale orphan",
+        )
+    )
+
+    log = store.read_status_df()
+    trades = store.read_trades_df()
+
+    class MockClient:
+        def futures_account_trades(self, symbol, limit=200):
+            return [
+                {
+                    "symbol": symbol,
+                    "orderId": 777,
+                    "side": "SELL",
+                    "price": "63988.51",
+                    "qty": "0.0533",
+                    "realizedPnl": "12.12",
+                    "time": 1890000000000,
+                }
+            ]
+
+    result = dashboard_stats.reconcile_manual_exchange_close(
+        store=store,
+        log=log,
+        trades=trades,
+        exchange_pos={"status": "flat"},
+        client=MockClient(),
+    )
+    assert result["inserted"] is True
+
+    trades2 = store.read_trades_df()
+    assert len(trades2) == 1
+    assert trades2.iloc[0]["session_id"] == "sess-manual"
+    assert trades2.iloc[0]["side"] == "LONG"
+    assert trades2.iloc[0]["outcome"] == "MANUAL"
+    assert trades2.iloc[0]["realized_pnl"] == pytest.approx(12.12)
+
+    # Second call should be idempotent (no duplicates).
+    result2 = dashboard_stats.reconcile_manual_exchange_close(
+        store=store,
+        log=store.read_status_df(),
+        trades=trades2,
+        exchange_pos={"status": "flat"},
+        client=MockClient(),
+    )
+    assert result2["inserted"] is False

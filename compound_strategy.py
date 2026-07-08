@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING
 
 import config
+import order_execution
 
 if TYPE_CHECKING:
     from bot_loop import Position
@@ -141,4 +142,13 @@ def compound_size_multiplier(consecutive_wins: int, consecutive_losses: int) -> 
     return max(
         config.COMPOUND_MIN_SIZE_MULT,
         min(config.COMPOUND_MAX_SIZE_MULT, mult),
+    )
+
+
+def post_sl_cooldown_seconds() -> int:
+    """Wall-clock seconds to block entries after a stop-loss exit."""
+    return (
+        order_execution.interval_minutes(config.INTERVAL)
+        * 60
+        * config.POST_SL_COOLDOWN_BARS
     )

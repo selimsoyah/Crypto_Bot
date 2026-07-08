@@ -43,6 +43,9 @@ def bot(tmp_path, monkeypatch):
     tb = TradingBot(store=store)
     tb.session_id = "testsession"
     monkeypatch.setattr(config, "USE_POST_ONLY_MAKER", True)
+    monkeypatch.setattr(config, "ENABLE_LONG_INVERSION", False)
+    monkeypatch.setattr(config, "USE_EMA50_TREND_GATE", False)
+    monkeypatch.setattr(config, "POST_SL_COOLDOWN_BARS", 0)
     monkeypatch.setattr(bot_loop.time, "sleep", lambda *_: None)
     tb._last_test_price = 60_000.0
 
@@ -64,6 +67,7 @@ def bot(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(tb, "_get_usdt_balance", lambda: 5_000.0)
     monkeypatch.setattr(tb, "_get_total_wallet_balance", lambda: 5_000.0)
+    monkeypatch.setattr(tb, "_flatten_exchange_orphans", lambda *a, **k: False)
     tb.risk.begin_session(5_000.0)
     return tb
 
