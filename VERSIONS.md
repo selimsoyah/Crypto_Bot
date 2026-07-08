@@ -3,8 +3,8 @@
 This document tracks **every major release** of the bot: what each version does, how
 to identify it at runtime, and what changed from the previous version.
 
-**Current release:** `v2.0.4` · **Default profile:** `COMPOUND` (Path B)  
-**Legacy profile still available:** `SWING` (v1.x behaviour via `TRADING_PROFILE=SWING`)
+**Current release:** `v2.1.0` · **Default profile:** `darvas_box` (`ACTIVE_PROFILE=darvas_box`)  
+**Legacy profile still available:** `xgboost_ml` (`ACTIVE_PROFILE=xgboost_ml`)
 
 ---
 
@@ -27,6 +27,7 @@ to identify it at runtime, and what changed from the previous version.
 | **v2.0.2** | COMPOUND + audit    | 15m       | —        | Honest threshold optimizer + label sweep tool  |
 | **v2.0.3** | COMPOUND + features | 15m       | —        | Phase 3 feature groups + aligned scalp brackets |
 | **v2.0.4** | COMPOUND + F2 tune  | 15m       | **✅**    | Asymmetric thresholds, F2 audit, capital-preserving OOS |
+| **v2.1.0** | **Darvas Box**      | **15m**   | **✅**    | Modular multi-profile runtime + breakout box engine |
 
 
 ---
@@ -470,6 +471,38 @@ python backtest_runner.py
 
 ---
 
+### v2.1.0 — Darvas Box multi-profile runtime (current)
+
+**Date:** 2026-07-08
+
+**Highlights**
+
+- Added `ACTIVE_PROFILE` runtime switch in `config.py` with a central profile catalog.
+- Added new standalone breakout module `box_strategy.py` (`BoxStrategyEngine`) with:
+  - rolling active box boundaries,
+  - confirmation-candle validation,
+  - breakout direction + optional volume gate.
+- Added `profiles/` package for per-profile settings:
+  - `xgboost_ml`
+  - `darvas_box`
+- Refactored `bot_loop.py` runtime branch:
+  - `xgboost_ml`: existing feature/model/threshold path unchanged.
+  - `darvas_box`: box breakout entry path with profile-specific TP/SL math.
+- Darvas risk logic in live loop:
+  - LONG breakout: close > box top
+  - SHORT breakout: close < box bottom
+  - SL anchored to box boundary with configurable 0.05% buffer
+  - TP = entry ± (box height × risk-reward ratio)
+  - trailing SL updates when a newly confirmed box provides tighter protection.
+- Dashboard compatibility updates:
+  - ML threshold circles auto-hide under `darvas_box`.
+  - Sidebar shows active box parameters instead of ML TP/SL copy.
+- Added tests:
+  - `tests/test_box_strategy.py`
+  - `tests/test_darvas_profile_runtime.py`
+
+---
+
 ## Side-by-side: SWING vs COMPOUND (today)
 
 ```
@@ -531,6 +564,7 @@ streamlit run dashboard.py
 | v2.0.1 → v2.0.2 | **Audit:** honest threshold optimizer, label sweep tool, sizing floor fix      |
 | v2.0.2 → v2.0.3 | **Features:** Phase 3 groups (F0–F5) + aligned scalp TP/SL (0.4%/0.25%)     |
 | v2.0.3 → v2.0.4 | **Tune:** asymmetric thresholds (L0.78/S0.60), F2 audit, `--retrain` CLI   |
+| v2.0.4 → v2.1.0 | **Strategy:** profile switch architecture + Darvas Box breakout engine         |
 
 
 ---
@@ -553,4 +587,4 @@ streamlit run dashboard.py
 
 ---
 
-*Last updated: 2026-07-06 · Current code release: **v2.0.4** · Default profile: **COMPOUND** · Recommended: `FEATURE_VARIANT=F2`*
+*Last updated: 2026-07-08 · Current code release: **v2.1.0** · Default profile: **darvas_box** · Legacy fallback: `ACTIVE_PROFILE=xgboost_ml`*

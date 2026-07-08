@@ -140,6 +140,48 @@ st.markdown(
 .thr-val { font-size: 1rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .thr-sub { font-size: 0.70rem; color: #a8b1bf; margin-top: 2px; }
 .thr-svg { width: 54px; height: 54px; flex-shrink: 0; }
+.profile-wrap {
+    border: 1px solid rgba(148, 163, 184, 0.20);
+    border-radius: 12px;
+    background: linear-gradient(160deg, rgba(15, 23, 42, 0.72), rgba(2, 6, 23, 0.8));
+    padding: 10px 12px;
+    margin-bottom: 10px;
+}
+.profile-kicker {
+    font-size: 0.66rem;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    margin-bottom: 4px;
+}
+.profile-title {
+    font-size: 1.02rem;
+    font-weight: 700;
+    color: #f8fafc;
+    margin-bottom: 6px;
+}
+.profile-sub {
+    font-size: 0.80rem;
+    color: #cbd5e1;
+    margin-top: 2px;
+}
+.box-grid {
+    margin-top: 8px;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(120px, 1fr));
+    gap: 8px;
+}
+.box-cell {
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    border-radius: 10px;
+    padding: 8px 10px;
+    background: rgba(15, 23, 42, 0.45);
+}
+.box-k { font-size: 0.66rem; color: #94a3b8; text-transform: uppercase; letter-spacing: .06em; }
+.box-v { font-size: 1rem; font-weight: 700; margin-top: 2px; color: #f8fafc; }
+.box-v.pos { color: #22c55e; }
+.box-v.neg { color: #ef4444; }
+.box-v.warn { color: #f59e0b; }
 .log-wrap {
     border: 1px solid rgba(148, 163, 184, 0.22);
     border-radius: 12px;
@@ -367,6 +409,50 @@ def render_venue_banner() -> None:
     st.caption(config.execution_banner_text())
 
 
+def render_profile_badge(bot) -> None:
+    active = str(getattr(config, "ACTIVE_PROFILE", "xgboost_ml")).strip()
+    title = "Darvas Box Breakout" if active == "darvas_box" else "XGBoost ML Inference"
+    st.markdown(
+        "<div class='profile-wrap'>"
+        "<div class='profile-kicker'>Active Runtime Profile</div>"
+        f"<div class='profile-title'>{html.escape(title)}</div>"
+        f"<div class='profile-sub'>{html.escape(config.profile_summary())}</div>",
+        unsafe_allow_html=True,
+    )
+    if active != "darvas_box":
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    box = getattr(bot, "_active_box", None) if bot is not None else None
+    if box is not None and getattr(box, "valid", False):
+        breakout = str(getattr(box, "breakout", "CASH")).upper()
+        tone = "warn"
+        if breakout == "LONG":
+            tone = "pos"
+        elif breakout == "SHORT":
+            tone = "neg"
+        st.markdown(
+            "<div class='box-grid'>"
+            f"<div class='box-cell'><div class='box-k'>Box Top</div><div class='box-v'>{float(getattr(box, 'top', 0.0)):,.2f}</div></div>"
+            f"<div class='box-cell'><div class='box-k'>Box Bottom</div><div class='box-v'>{float(getattr(box, 'bottom', 0.0)):,.2f}</div></div>"
+            f"<div class='box-cell'><div class='box-k'>Box Height</div><div class='box-v'>{float(getattr(box, 'height', 0.0)):,.2f}</div></div>"
+            f"<div class='box-cell'><div class='box-k'>Breakout</div><div class='box-v {tone}'>{html.escape(breakout)}</div></div>"
+            "</div>"
+            f"<div class='profile-sub'>Lookback {config.BOX_LOOKBACK_CANDLES} · Confirm {config.BOX_CONFIRMATION_CANDLES} · "
+            f"RR {config.BOX_RISK_REWARD_RATIO:.2f} · Vol x{config.BOX_VOLUME_FILTER_MULTIPLIER:.2f}</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown(
+        "<div class='profile-sub'>Waiting for a confirmed live box. "
+        f"Need at least {config.BOX_LOOKBACK_CANDLES + config.BOX_CONFIRMATION_CANDLES} candles.</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_top_metrics(metrics: dict) -> None:
     wallet = metrics["wallet_balance"]
     net = metrics["net_pnl"]
@@ -429,6 +515,11 @@ def _circle_card(label: str, value: float, threshold: float, color: str) -> str:
 
 
 def render_threshold_circles(stats: dict) -> None:
+    if not config.is_xgboost_ml_profile():
+        st.caption(
+            "Darvas Box profile active — ML probability thresholds are not used."
+        )
+        return
     long_thr, short_thr, thr_source = get_live_thresholds()
     cards_html = (
         _circle_card("Long", float(stats.get("prob_long", 0.0)), long_thr, "#22c55e")
@@ -734,7 +825,15 @@ def render_sidebar_controls(bot):
         st.caption(config.execution_banner_text())
         st.caption(
             f"{config.SYMBOL} · {config.INTERVAL} · {config.LEVERAGE}x · "
-            f"TP +{config.TAKE_PROFIT_PCT:.1%} / SL -{config.STOP_LOSS_PCT:.1%}"
+            + (
+                (
+                    f"Box L{config.BOX_LOOKBACK_CANDLES}/C{config.BOX_CONFIRMATION_CANDLES} · "
+                    f"RR {config.BOX_RISK_REWARD_RATIO:.2f} · "
+                    f"Vol x{config.BOX_VOLUME_FILTER_MULTIPLIER:.2f}"
+                )
+                if config.is_darvas_box_profile()
+                else f"TP +{config.TAKE_PROFIT_PCT:.1%} / SL -{config.STOP_LOSS_PCT:.1%}"
+            )
         )
 
         if config.execution_is_live():
@@ -839,6 +938,7 @@ render_sidebar_controls(bot)
 
 st.title("BTC/USDT ML Futures Desk")
 render_venue_banner()
+render_profile_badge(bot)
 
 log_df = load_log()
 trades_df = load_trades()

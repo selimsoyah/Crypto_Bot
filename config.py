@@ -24,6 +24,13 @@ import logging
 import os
 from pathlib import Path
 from typing import Final
+from profiles import (
+    PROFILE_DARVAS_BOX,
+    PROFILE_XGBOOST_ML,
+    SUPPORTED_PROFILES,
+    build_profile_catalog,
+    normalize_profile_name,
+)
 
 # --------------------------------------------------------------------------- #
 # Optional .env loading                                                        #
@@ -112,6 +119,15 @@ TRADING_PROFILE: Final[str] = _env("TRADING_PROFILE", "COMPOUND").upper()
 # Phase 3 feature variant (F0=baseline … F5=all extras). See feature_sweep.py.
 FEATURE_VARIANT: Final[str] = _env("FEATURE_VARIANT", "F0").upper()
 
+# Strategy runtime profile: xgboost_ml (legacy) or darvas_box (new breakout mode).
+_ACTIVE_PROFILE_RAW = _env("ACTIVE_PROFILE", PROFILE_DARVAS_BOX)
+ACTIVE_PROFILE: Final[str] = normalize_profile_name(_ACTIVE_PROFILE_RAW)
+if ACTIVE_PROFILE not in SUPPORTED_PROFILES:
+    ACTIVE_PROFILE = PROFILE_DARVAS_BOX
+
+PROFILE_SETTINGS: Final[dict] = build_profile_catalog()
+ACTIVE_PROFILE_SETTINGS: Final[dict] = PROFILE_SETTINGS[ACTIVE_PROFILE]
+
 
 def is_compound_profile() -> bool:
     """Return ``True`` when Path B active-compounding settings are active."""
@@ -122,12 +138,59 @@ def is_swing_profile() -> bool:
     return TRADING_PROFILE == "SWING"
 
 
+def is_xgboost_ml_profile() -> bool:
+    return ACTIVE_PROFILE == PROFILE_XGBOOST_ML
+
+
+def is_darvas_box_profile() -> bool:
+    return ACTIVE_PROFILE == PROFILE_DARVAS_BOX
+
+
 # --------------------------------------------------------------------------- #
 # Market / strategy parameters (profile-aware defaults)                       #
 # --------------------------------------------------------------------------- #
 SYMBOL: Final[str] = "BTCUSDT"
 
-if is_compound_profile():
+BOX_LOOKBACK_CANDLES: Final[int] = int(
+    _env(
+        "BOX_LOOKBACK_CANDLES",
+        str(ACTIVE_PROFILE_SETTINGS.get("box_lookback_candles", 20)),
+    )
+)
+BOX_CONFIRMATION_CANDLES: Final[int] = int(
+    _env(
+        "BOX_CONFIRMATION_CANDLES",
+        str(ACTIVE_PROFILE_SETTINGS.get("box_confirmation_candles", 3)),
+    )
+)
+BOX_RISK_REWARD_RATIO: Final[float] = float(
+    _env(
+        "BOX_RISK_REWARD_RATIO",
+        str(ACTIVE_PROFILE_SETTINGS.get("risk_to_reward_ratio", 2.0)),
+    )
+)
+BOX_VOLUME_FILTER_MULTIPLIER: Final[float] = float(
+    _env(
+        "BOX_VOLUME_FILTER_MULTIPLIER",
+        str(ACTIVE_PROFILE_SETTINGS.get("volume_filter_multiplier", 1.2)),
+    )
+)
+BOX_STOP_BUFFER_PCT: Final[float] = float(
+    _env("BOX_STOP_BUFFER_PCT", str(ACTIVE_PROFILE_SETTINGS.get("stop_buffer_pct", 0.0005)))
+)
+
+if is_darvas_box_profile():
+    INTERVAL: Final[str] = _env("INTERVAL", "15m")
+    HISTORY_YEARS: Final[int] = int(_env("HISTORY_YEARS", "2"))
+    FORWARD_WINDOW: Final[int] = int(_env("FORWARD_WINDOW", "16"))
+    STRUCTURE_LOOKBACK: Final[int] = int(_env("STRUCTURE_LOOKBACK", "96"))
+    RETURN_LONG_LOOKBACK: Final[int] = int(_env("RETURN_LONG_LOOKBACK", "96"))
+    TAKE_PROFIT_PCT: Final[float] = float(_env("TAKE_PROFIT_PCT", "0.008"))
+    STOP_LOSS_PCT: Final[float] = float(_env("STOP_LOSS_PCT", "0.005"))
+    HISTORICAL_PARQUET: Final[str] = str(
+        BASE_DIR / _env("HISTORICAL_PARQUET", "historical_btc_15m.parquet")
+    )
+elif is_compound_profile():
     # 15m bars — more setups per day for compounding-style activity.
     INTERVAL: Final[str] = _env("INTERVAL", "15m")
     HISTORY_YEARS: Final[int] = int(_env("HISTORY_YEARS", "2"))
@@ -426,7 +489,7 @@ def execution_banner_text() -> str:
     """Human-readable venue banner for logs and dashboard."""
     exec_label = "LIVE MAINNET" if execution_is_live() else "TESTNET"
     data_label = "Mainnet" if USE_MAINNET_DATA else "Testnet"
-    profile = TRADING_PROFILE
+    profile = f"{TRADING_PROFILE}/{ACTIVE_PROFILE}"
     return (
         f"EXECUTION: {exec_label} | MARKET DATA: {data_label} | "
         f"{SYMBOL} {INTERVAL} {LEVERAGE}x | {profile}"
@@ -435,6 +498,12 @@ def execution_banner_text() -> str:
 
 def profile_summary() -> str:
     """One-line description of the active trading profile."""
+    if is_darvas_box_profile():
+        return (
+            f"Darvas Box mode — {INTERVAL} bars, lookback {BOX_LOOKBACK_CANDLES}, "
+            f"confirm {BOX_CONFIRMATION_CANDLES}, RR {BOX_RISK_REWARD_RATIO:.2f}, "
+            f"vol x{BOX_VOLUME_FILTER_MULTIPLIER:.2f}"
+        )
     if is_compound_profile():
         return (
             f"Compound mode — {INTERVAL} bars, TP/SL {TAKE_PROFIT_PCT:.2%}/"
@@ -450,6 +519,10 @@ def validate_execution_config() -> list[str]:
     if EXECUTION_VENUE not in ("TESTNET", "LIVE"):
         errors.append(
             f"EXECUTION_VENUE must be TESTNET or LIVE (got {EXECUTION_VENUE!r})."
+        )
+    if ACTIVE_PROFILE not in SUPPORTED_PROFILES:
+        errors.append(
+            f"ACTIVE_PROFILE must be one of {SUPPORTED_PROFILES} (got {ACTIVE_PROFILE!r})."
         )
     if execution_is_live() and not credentials_present():
         errors.append(

@@ -56,6 +56,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import config
+import box_strategy
 import compound_strategy
 import data_pipeline
 import exchange_client
@@ -97,6 +98,8 @@ def resolve_live_thresholds() -> tuple[float, float, str]:
     config constants are the explicit fallback. ``source`` describes which one
     was used so the operator is never shown a number the bot is not trading.
     """
+    if not config.is_xgboost_ml_profile():
+        return 0.0, 0.0, f"profile={config.ACTIVE_PROFILE} (ML thresholds disabled)"
     long_thr, short_thr = model_brain.load_thresholds()
     if os.path.exists(config.THRESHOLD_PATH):
         source = f"tuned sidecar ({os.path.basename(config.THRESHOLD_PATH)})"
@@ -821,6 +824,13 @@ class TradingBot:
         self._bracket_closed_this_iteration: bool = False
         self._post_sl_cooldown_until: Optional[datetime] = None
         self._session_armed: bool = False
+        self._box_engine = box_strategy.BoxStrategyEngine(
+            lookback_candles=config.BOX_LOOKBACK_CANDLES,
+            confirmation_candles=config.BOX_CONFIRMATION_CANDLES,
+            risk_to_reward_ratio=config.BOX_RISK_REWARD_RATIO,
+            volume_filter_multiplier=config.BOX_VOLUME_FILTER_MULTIPLIER,
+        )
+        self._active_box: Optional[box_strategy.BoxState] = None
         if not _skip_session_recovery:
             recover_orphan_session_export(self.store)
 
@@ -936,6 +946,13 @@ class TradingBot:
             logger.warning("Could not fetch futures exchange info: %s", exc)
 
     def _load_model(self) -> None:
+        if not config.is_xgboost_ml_profile():
+            self._model = None
+            logger.info(
+                "Active profile %s does not require ML model loading.",
+                config.ACTIVE_PROFILE,
+            )
+            return
         self._model = model_brain.load_model()
         self._long_threshold, self._short_threshold, thr_source = resolve_live_thresholds()
         logger.info(
@@ -1219,6 +1236,8 @@ class TradingBot:
         *,
         candles=None,
         book: Optional[order_execution.BookTicker] = None,
+        bracket_override: Optional[tuple[float, float]] = None,
+        signal_label: str = "XGBoost",
     ) -> None:
         """Open a LONG or SHORT with volatility-aware margin from the risk engine."""
         blocked, block_reason = self._post_sl_entry_blocked()
@@ -1270,7 +1289,7 @@ class TradingBot:
         # --- Blocked: insufficient free margin for allocated slice -------- #
         if available < order_usdt_value:
             reason = (
-                f"XGBoost triggered a valid {side} signal "
+                f"{signal_label} triggered a valid {side} signal "
                 f"({probability * 100:.1f}% probability), but the order was "
                 f"BLOCKED due to insufficient USDT balance "
                 f"(need ${order_usdt_value:,.2f}, available ${available:,.2f})."
@@ -1282,7 +1301,7 @@ class TradingBot:
         # Exchange min-notional guard (e.g. -4164 if below 50 USDT on testnet).
         if notional < self._min_notional:
             reason = (
-                f"XGBoost triggered a valid {side} signal "
+                f"{signal_label} triggered a valid {side} signal "
                 f"({probability * 100:.1f}% probability), but the order was "
                 f"BLOCKED because notional ${notional:,.2f} is below the "
                 f"exchange minimum ${self._min_notional:,.2f}."
@@ -1354,7 +1373,10 @@ class TradingBot:
             )
             return
 
-        tp, sl = bracket_prices(direction, fill_price, atr_pct)
+        if bracket_override is not None:
+            tp, sl = bracket_override
+        else:
+            tp, sl = bracket_prices(direction, fill_price, atr_pct)
         entry_candle_ts = self._current_candle_ts(candles) if candles is not None else self._now_iso()
 
         floor_note = ""
@@ -1375,7 +1397,7 @@ class TradingBot:
 
         order_mode = "POST-ONLY LIMIT (GTX/maker)" if config.USE_POST_ONLY_MAKER else "LIMIT"
         reason = (
-            f"XGBoost triggered {side} signal ({probability * 100:.1f}% "
+            f"{signal_label} triggered {side} signal ({probability * 100:.1f}% "
             f"probability). Entering {direction} via {order_mode} at "
             f"${fill_price:,.2f} (spread {spread_gate.spread_pct * 100:.4f}%). "
             f"{effective_alloc:.0f}% vol-scaled allocation "
@@ -1691,19 +1713,48 @@ class TradingBot:
         from feature_factory import compute_live_features
 
         enriched = compute_live_features(candles)
-        atr_pct = float(enriched["atr_pct"].dropna().iloc[-1]) if not enriched["atr_pct"].dropna().empty else config.RISK_ATR_BASELINE_PCT
-
-        signal = model_brain.predict_latest(self._model, candles)
-        direction = model_brain.decide_direction(
-            signal["prob_long"],
-            signal["prob_short"],
-            signal["trend"],
-            self._long_threshold,
-            self._short_threshold,
-            price_vs_ema50=signal.get("price_vs_ema50", 0.0),
-            prob_cash=signal.get("prob_cash"),
+        atr_pct = (
+            float(enriched["atr_pct"].dropna().iloc[-1])
+            if not enriched["atr_pct"].dropna().empty
+            else config.RISK_ATR_BASELINE_PCT
         )
-        self._log_directional_signal(signal, direction)
+
+        box_state: Optional[box_strategy.BoxState] = None
+        entry_brackets: Optional[tuple[float, float]] = None
+        signal_label = "XGBoost"
+        if config.is_xgboost_ml_profile():
+            signal = model_brain.predict_latest(self._model, candles)
+            direction = model_brain.decide_direction(
+                signal["prob_long"],
+                signal["prob_short"],
+                signal["trend"],
+                self._long_threshold,
+                self._short_threshold,
+                price_vs_ema50=signal.get("price_vs_ema50", 0.0),
+                prob_cash=signal.get("prob_cash"),
+            )
+            self._log_directional_signal(signal, direction)
+        else:
+            box_state = self._box_engine.evaluate(candles)
+            self._active_box = box_state
+            direction = box_state.breakout if box_state.valid else "CASH"
+            signal = {
+                "prob_long": 1.0 if direction == "LONG" else 0.0,
+                "prob_short": 1.0 if direction == "SHORT" else 0.0,
+                "prob_cash": 1.0 if direction == "CASH" else 0.0,
+                "trend": 0.0,
+            }
+            signal_label = "Darvas Box"
+            if box_state.valid and direction in {"LONG", "SHORT"}:
+                entry_brackets = self._box_brackets(direction, price, box_state)
+            logger.info(
+                "BOX SCAN | top %.2f | bottom %.2f | close %.2f | breakout=%s | volume_ok=%s",
+                box_state.top,
+                box_state.bottom,
+                price,
+                direction,
+                box_state.volume_ok,
+            )
 
         # Balance fetch must stay OUTSIDE state._lock — _get_usdt_balance() updates
         # connection flags via _mark_api_success(), which also acquires the lock.
@@ -1717,10 +1768,20 @@ class TradingBot:
             self.state.usdt_balance = usdt_balance
             self.state.last_action = "HOLD"
             self.state.last_event = "WAIT"
-            self.state.last_reason = (
-                f"Scanning market — LONG {signal['prob_long'] * 100:.1f}% | "
-                f"SHORT {signal['prob_short'] * 100:.1f}% | direction {direction}."
-            )
+            if config.is_xgboost_ml_profile():
+                self.state.last_reason = (
+                    f"Scanning market — LONG {signal['prob_long'] * 100:.1f}% | "
+                    f"SHORT {signal['prob_short'] * 100:.1f}% | direction {direction}."
+                )
+            elif box_state and box_state.valid:
+                self.state.last_reason = (
+                    f"Darvas box active ({box_state.bottom:,.2f} - {box_state.top:,.2f}); "
+                    f"close ${price:,.2f} -> {direction}."
+                )
+            else:
+                self.state.last_reason = (
+                    "Darvas box not confirmed yet — waiting for enough candles."
+                )
 
         pos = self.state.position
 
@@ -1750,7 +1811,10 @@ class TradingBot:
                 self._close_position(price, reason_code="TIMEOUT")
                 pos = None
             elif pos is not None:
-                compound_strategy.update_trailing_stop(pos, price)
+                if config.is_darvas_box_profile():
+                    self._trail_stop_from_box(pos, self._active_box or box_strategy.BoxState(valid=False))
+                else:
+                    compound_strategy.update_trailing_stop(pos, price)
                 if pos.side == "LONG":
                     if price >= pos.take_profit_price:
                         self._close_position(price, reason_code="TP")
@@ -1778,7 +1842,13 @@ class TradingBot:
                 pos = None
             if pos is None:
                 self._open_position(
-                    "LONG", price, signal["prob_long"], atr_pct, candles=candles
+                    "LONG",
+                    price,
+                    signal["prob_long"],
+                    atr_pct,
+                    candles=candles,
+                    bracket_override=entry_brackets,
+                    signal_label=signal_label,
                 )
         elif direction == "SHORT":
             if pos is not None and pos.side == "LONG":
@@ -1786,18 +1856,29 @@ class TradingBot:
                 pos = None
             if pos is None:
                 self._open_position(
-                    "SHORT", price, signal["prob_short"], atr_pct, candles=candles
+                    "SHORT",
+                    price,
+                    signal["prob_short"],
+                    atr_pct,
+                    candles=candles,
+                    bracket_override=entry_brackets,
+                    signal_label=signal_label,
                 )
         else:
             # CASH: explain why no trade was taken (only when flat; if a position
             # is open the bracket messages above already describe the state).
             if pos is None:
-                cash_reason = self._cash_reason(signal)
-                if (
-                    signal["prob_long"] > self._long_threshold
-                    or signal["prob_short"] > self._short_threshold
-                ):
-                    logger.info("Skipped Entry [CASH]: %s", cash_reason)
+                if config.is_xgboost_ml_profile():
+                    cash_reason = self._cash_reason(signal)
+                    if (
+                        signal["prob_long"] > self._long_threshold
+                        or signal["prob_short"] > self._short_threshold
+                    ):
+                        logger.info("Skipped Entry [CASH]: %s", cash_reason)
+                else:
+                    cash_reason = self._box_cash_reason(
+                        box_state or box_strategy.BoxState(valid=False)
+                    )
                 self._set_reason("CASH", "HOLD", cash_reason)
 
         # Heartbeat row — skipped when a transition already logged itself this
@@ -1833,6 +1914,55 @@ class TradingBot:
             f"(LONG {p_long:.1f}% vs {long_thr:.1f}% | "
             f"SHORT {p_short:.1f}% vs {short_thr:.1f}%). Sitting safely in CASH."
         )
+
+    def _box_cash_reason(self, box_state: box_strategy.BoxState) -> str:
+        if not box_state.valid:
+            return box_state.reason or "Waiting for a confirmed Darvas box."
+        return (
+            f"Price inside Darvas box ({box_state.bottom:,.2f} - {box_state.top:,.2f}). "
+            "Staying FLAT until breakout close."
+        )
+
+    def _box_brackets(
+        self,
+        direction: str,
+        entry_price: float,
+        box_state: box_strategy.BoxState,
+    ) -> tuple[float, float]:
+        height = max(box_state.height, entry_price * 0.001)
+        if direction == "LONG":
+            sl = box_state.bottom * (1.0 - config.BOX_STOP_BUFFER_PCT)
+            tp = entry_price + (height * config.BOX_RISK_REWARD_RATIO)
+        else:
+            sl = box_state.top * (1.0 + config.BOX_STOP_BUFFER_PCT)
+            tp = entry_price - (height * config.BOX_RISK_REWARD_RATIO)
+        return tp, sl
+
+    def _trail_stop_from_box(self, pos: Position, box_state: box_strategy.BoxState) -> None:
+        if not box_state.valid:
+            return
+        if pos.side == "LONG":
+            candidate = box_state.bottom * (1.0 - config.BOX_STOP_BUFFER_PCT)
+            if candidate > pos.stop_loss_price:
+                logger.info(
+                    "Darvas trailing stop LONG: %.2f -> %.2f (new box bottom %.2f)",
+                    pos.stop_loss_price,
+                    candidate,
+                    box_state.bottom,
+                )
+                pos.stop_loss_price = candidate
+                pos.trail_active = True
+        elif pos.side == "SHORT":
+            candidate = box_state.top * (1.0 + config.BOX_STOP_BUFFER_PCT)
+            if candidate < pos.stop_loss_price:
+                logger.info(
+                    "Darvas trailing stop SHORT: %.2f -> %.2f (new box top %.2f)",
+                    pos.stop_loss_price,
+                    candidate,
+                    box_state.top,
+                )
+                pos.stop_loss_price = candidate
+                pos.trail_active = True
 
     def _write_boot_status(self) -> None:
         """Write an immediate heartbeat so the dashboard sees the engine is alive."""

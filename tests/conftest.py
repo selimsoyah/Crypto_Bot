@@ -5,6 +5,7 @@ import sys
 
 # Keep legacy tests stable — compound profile is the live default.
 os.environ.setdefault("TRADING_PROFILE", "SWING")
+os.environ.setdefault("ACTIVE_PROFILE", "xgboost_ml")
 
 import pandas as pd
 import pytest
