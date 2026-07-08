@@ -66,6 +66,59 @@ st.markdown(
 .thr-val { font-size: 1rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .thr-sub { font-size: 0.70rem; color: #a8b1bf; margin-top: 2px; }
 .thr-svg { width: 54px; height: 54px; flex-shrink: 0; }
+.desk-panel {
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    border-radius: 14px;
+    background: linear-gradient(165deg, rgba(15, 23, 42, 0.88), rgba(2, 6, 23, 0.94));
+    box-shadow: 0 10px 28px rgba(2, 6, 23, 0.5);
+    padding: 14px 14px 12px;
+    margin-bottom: 12px;
+}
+.desk-section-title {
+    font-size: 0.72rem;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    margin: 0 0 10px 2px;
+}
+.desk-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(140px, 1fr));
+    gap: 10px;
+}
+.desk-card {
+    border: 1px solid rgba(148, 163, 184, 0.2);
+    border-radius: 12px;
+    padding: 12px 14px;
+    background: rgba(15, 23, 42, 0.55);
+    min-height: 96px;
+}
+.desk-card.pos { border-color: rgba(34, 197, 94, 0.45); background: rgba(34, 197, 94, 0.08); }
+.desk-card.neg { border-color: rgba(239, 68, 68, 0.45); background: rgba(239, 68, 68, 0.08); }
+.desk-card.side-long { border-color: rgba(34, 197, 94, 0.5); }
+.desk-card.side-short { border-color: rgba(239, 68, 68, 0.5); }
+.desk-title { font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; letter-spacing: .06em; }
+.desk-odo {
+    font-size: 1.45rem;
+    font-weight: 800;
+    margin-top: 6px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+}
+.desk-odo.pos { color: #22c55e; }
+.desk-odo.neg { color: #ef4444; }
+.desk-odo.neutral { color: #f8fafc; }
+.desk-odo.long { color: #22c55e; }
+.desk-odo.short { color: #ef4444; }
+.desk-sub { font-size: 0.76rem; color: #a8b1bf; margin-top: 6px; }
+.desk-empty {
+    border: 1px dashed rgba(148, 163, 184, 0.35);
+    border-radius: 10px;
+    padding: 14px;
+    color: #94a3b8;
+    font-size: 0.86rem;
+    text-align: center;
+}
 .log-wrap {
     border: 1px solid rgba(148, 163, 184, 0.22);
     border-radius: 12px;
@@ -368,30 +421,209 @@ def render_threshold_circles(stats: dict) -> None:
     )
 
 
-def render_position_panel(exchange_pos: Optional[dict], bot=None) -> None:
-    st.subheader("Live Position")
+def _pnl_tone(value: float) -> str:
+    if value > 0:
+        return "pos"
+    if value < 0:
+        return "neg"
+    return "neutral"
+
+
+def _text_card(title: str, text: str, *, tone: str = "neutral", card_cls: str = "", sub: str = "") -> str:
+    sub_html = f'<div class="desk-sub">{html.escape(sub)}</div>' if sub else ""
+    return (
+        f'<div class="desk-card {card_cls}">'
+        f'<div class="desk-title">{html.escape(title)}</div>'
+        f'<div class="desk-odo {tone}">{html.escape(text)}</div>'
+        f"{sub_html}"
+        f"</div>"
+    )
+
+
+def _odo_card(
+    key: str,
+    title: str,
+    value: float,
+    *,
+    decimals: int = 2,
+    prefix: str = "",
+    suffix: str = "",
+    tone: str = "neutral",
+    sub: str = "",
+    card_cls: str = "",
+) -> str:
+    card_tone = card_cls or tone
+    sub_html = f'<div class="desk-sub">{html.escape(sub)}</div>' if sub else ""
+    return (
+        f'<div class="desk-card {card_tone}">'
+        f'<div class="desk-title">{html.escape(title)}</div>'
+        f'<div id="odo-{html.escape(key)}" class="desk-odo {tone}" '
+        f'data-key="{html.escape(key)}" data-target="{value}" data-decimals="{decimals}" '
+        f'data-prefix="{html.escape(prefix)}" data-suffix="{html.escape(suffix)}" '
+        f'data-signed="{"1" if tone in ("pos", "neg") else "0"}"></div>'
+        f"{sub_html}"
+        f"</div>"
+    )
+
+
+def _odo_panel_html(sections: list[str], height: int) -> None:
+    body = "".join(sections)
+    panel = f"""
+    <div class="desk-panel">{body}</div>
+    <script>
+    (function() {{
+      function fmt(v, d, prefix, suffix, signed) {{
+        const n = Number(v);
+        const sign = signed && n > 0 ? "+" : "";
+        return `${{prefix}}${{sign}}${{n.toLocaleString(undefined, {{minimumFractionDigits:d, maximumFractionDigits:d}})}}${{suffix}}`;
+      }}
+      document.querySelectorAll('[id^="odo-"]').forEach((el) => {{
+        const k = el.dataset.key;
+        const target = Number(el.dataset.target || 0);
+        const d = Number(el.dataset.decimals || 0);
+        const prefix = el.dataset.prefix || "";
+        const suffix = el.dataset.suffix || "";
+        const signed = el.dataset.signed === "1";
+        const sk = "desk_odo_" + k;
+        const prev = Number(sessionStorage.getItem(sk) || target);
+        const start = Number.isFinite(prev) ? prev : target;
+        const delta = target - start;
+        const startTs = performance.now();
+        const dur = 900;
+        function tick(ts) {{
+          const t = Math.min(1, (ts - startTs) / dur);
+          const eased = 1 - Math.pow(1 - t, 3);
+          const val = start + delta * eased;
+          el.textContent = fmt(val, d, prefix, suffix, signed);
+          if (t < 1) requestAnimationFrame(tick);
+          else sessionStorage.setItem(sk, String(target));
+        }}
+        requestAnimationFrame(tick);
+      }});
+    }})();
+    </script>
+    """
+    components.html(panel, height=height, scrolling=False)
+
+
+def render_compound_and_position(
+    comp: Optional[dict],
+    exchange_pos: Optional[dict],
+    bot=None,
+) -> None:
+    sections: list[str] = []
+
+    if comp is not None:
+        pnl_tone = _pnl_tone(float(comp["pnl_7d"]))
+        exp_tone = _pnl_tone(float(comp["expectancy"]))
+        compound_cards = (
+            _odo_card("7d_trades", "7d Trades", float(comp["trades_7d"]), decimals=0, tone="neutral")
+            + _odo_card(
+                "7d_pnl",
+                "7d PnL",
+                float(comp["pnl_7d"]),
+                tone=pnl_tone,
+                card_cls=pnl_tone,
+            )
+            + _odo_card(
+                "expectancy",
+                "Expectancy",
+                float(comp["expectancy"]),
+                tone=exp_tone,
+                card_cls=exp_tone,
+            )
+            + _odo_card(
+                "size_mult",
+                "Size Mult",
+                float(comp["size_mult"]),
+                decimals=2,
+                suffix="x",
+                tone="neutral",
+            )
+        )
+        sections.append(
+            '<div class="desk-section-title">7-Day Performance</div>'
+            f'<div class="desk-grid">{compound_cards}</div>'
+        )
+
+    sections.append('<div class="desk-section-title" style="margin-top:14px;">Live Position</div>')
+
     if not exchange_pos or exchange_pos.get("status") == "flat":
-        st.info("No open exchange position.")
-        return
-    if exchange_pos.get("status") == "error":
-        st.warning(f"Could not fetch exchange position: {exchange_pos.get('message', '')}")
-        return
+        sections.append('<div class="desk-empty">No open exchange position.</div>')
+    elif exchange_pos.get("status") == "error":
+        msg = html.escape(str(exchange_pos.get("message", "unknown error")))
+        sections.append(f'<div class="desk-empty">Could not fetch exchange position: {msg}</div>')
+    else:
+        side = str(exchange_pos.get("side", "FLAT")).upper()
+        side_tone = "long" if side == "LONG" else ("short" if side == "SHORT" else "neutral")
+        side_card = "side-long" if side == "LONG" else ("side-short" if side == "SHORT" else "")
+        pnl = float(exchange_pos.get("unrealized_pnl", 0.0) or 0.0)
+        pct = float(exchange_pos.get("pct_change", 0.0) or 0.0)
+        pnl_tone = _pnl_tone(pnl)
+        pct_tone = _pnl_tone(pct)
 
-    tp = sl = 0.0
-    if bot is not None and bot.state.position is not None:
-        tp = bot.state.position.take_profit_price
-        sl = bot.state.position.stop_loss_price
+        tp = sl = 0.0
+        if bot is not None and bot.state.position is not None:
+            tp = bot.state.position.take_profit_price
+            sl = bot.state.position.stop_loss_price
+        footer = (
+            f"TP ${tp:,.2f} · SL ${sl:,.2f}"
+            if tp and sl
+            else "TP/SL managed by bot when position is internal."
+        )
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Side", exchange_pos.get("side", "FLAT"))
-    c2.metric("Qty", f"{exchange_pos.get('quantity', 0.0):.4f} BTC")
-    c3.metric("Entry", f"${exchange_pos.get('entry_price', 0.0):,.2f}")
-    c4.metric("Mark", f"${exchange_pos.get('mark_price', 0.0):,.2f}")
+        position_cards = (
+            _text_card("Side", side, tone=side_tone, card_cls=side_card)
+            + _odo_card(
+                "pos_qty",
+                "Qty",
+                float(exchange_pos.get("quantity", 0.0) or 0.0),
+                decimals=4,
+                suffix=" BTC",
+                tone="neutral",
+            )
+            + _odo_card(
+                "pos_entry",
+                "Entry",
+                float(exchange_pos.get("entry_price", 0.0) or 0.0),
+                decimals=2,
+                prefix="$",
+                tone="neutral",
+            )
+            + _odo_card(
+                "pos_mark",
+                "Mark",
+                float(exchange_pos.get("mark_price", 0.0) or 0.0),
+                decimals=2,
+                prefix="$",
+                tone="neutral",
+            )
+            + _odo_card(
+                "pos_upnl",
+                "Unrealized",
+                pnl,
+                decimals=2,
+                prefix="$",
+                tone=pnl_tone,
+                card_cls=pnl_tone,
+            )
+            + _odo_card(
+                "pos_upnl_pct",
+                "Unrealized %",
+                pct,
+                decimals=2,
+                suffix="%",
+                tone=pct_tone,
+                card_cls=pct_tone,
+            )
+        )
+        sections.append(f'<div class="desk-grid" style="grid-template-columns:repeat(6,minmax(120px,1fr));">{position_cards}</div>')
+        sections.append(f'<div class="desk-sub" style="margin:10px 2px 0;">{html.escape(footer)}</div>')
 
-    pnl = float(exchange_pos.get("unrealized_pnl", 0.0) or 0.0)
-    pct = float(exchange_pos.get("pct_change", 0.0) or 0.0)
-    st.metric("Unrealized", f"${pnl:+,.2f}", delta=f"{pct:+.2f}%")
-    st.caption(f"TP: ${tp:,.2f} · SL: ${sl:,.2f}" if tp and sl else "TP/SL managed by bot when position is internal.")
+    row_count = 2 if comp is not None else 1
+    has_position = exchange_pos and exchange_pos.get("status") not in (None, "flat", "error")
+    height = 120 + (row_count - 1) * 118 + (118 if has_position else 52)
+    _odo_panel_html(sections, height=height)
 
 
 def render_activity(log_df: pd.DataFrame) -> None:
@@ -624,13 +856,9 @@ render_top_metrics(metrics)
 
 if config.is_compound_profile():
     comp = dashboard_stats.compute_compound_metrics(trades_df, bot=bot)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("7d Trades", comp["trades_7d"])
-    c2.metric("7d PnL", f"{comp['pnl_7d']:+.2f}")
-    c3.metric("Expectancy", f"{comp['expectancy']:+.2f}")
-    c4.metric("Size Mult", f"{comp['size_mult']:.2f}x")
-
-render_position_panel(exchange_pos, bot=bot)
+else:
+    comp = None
+render_compound_and_position(comp, exchange_pos, bot=bot)
 
 left, right = st.columns([1, 1], gap="large")
 with left:
