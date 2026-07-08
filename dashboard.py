@@ -12,6 +12,80 @@ import config
 import dashboard_stats
 import exchange_client
 
+DESK_PANEL_CSS = """
+html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    font-family: "Source Sans Pro", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #f8fafc;
+}
+.desk-panel {
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    border-radius: 14px;
+    background: linear-gradient(165deg, rgba(15, 23, 42, 0.88), rgba(2, 6, 23, 0.94));
+    box-shadow: 0 10px 28px rgba(2, 6, 23, 0.5);
+    padding: 14px 14px 12px;
+    margin-bottom: 4px;
+    box-sizing: border-box;
+}
+.desk-section-title {
+    font-size: 0.72rem;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    margin: 0 0 10px 2px;
+}
+.desk-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+}
+.desk-grid.six {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+.desk-card {
+    border: 1px solid rgba(148, 163, 184, 0.2);
+    border-radius: 12px;
+    padding: 12px 14px;
+    background: rgba(15, 23, 42, 0.55);
+    min-height: 96px;
+    box-sizing: border-box;
+}
+.desk-card.pos { border-color: rgba(34, 197, 94, 0.45); background: rgba(34, 197, 94, 0.08); }
+.desk-card.neg { border-color: rgba(239, 68, 68, 0.45); background: rgba(239, 68, 68, 0.08); }
+.desk-card.side-long { border-color: rgba(34, 197, 94, 0.5); }
+.desk-card.side-short { border-color: rgba(239, 68, 68, 0.5); }
+.desk-title { font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; letter-spacing: .06em; }
+.desk-odo {
+    font-size: 1.45rem;
+    font-weight: 800;
+    margin-top: 6px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+}
+.desk-odo.pos { color: #22c55e; }
+.desk-odo.neg { color: #ef4444; }
+.desk-odo.neutral { color: #f8fafc; }
+.desk-odo.long { color: #22c55e; }
+.desk-odo.short { color: #ef4444; }
+.desk-sub { font-size: 0.76rem; color: #a8b1bf; margin-top: 6px; }
+.desk-empty {
+    border: 1px dashed rgba(148, 163, 184, 0.35);
+    border-radius: 10px;
+    padding: 14px;
+    color: #94a3b8;
+    font-size: 0.86rem;
+    text-align: center;
+}
+@media (max-width: 1100px) {
+    .desk-grid.six { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 700px) {
+    .desk-grid, .desk-grid.six { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+"""
+
 st.set_page_config(
     page_title="BTC/USDT ML Futures Desk",
     page_icon="📈",
@@ -66,59 +140,6 @@ st.markdown(
 .thr-val { font-size: 1rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .thr-sub { font-size: 0.70rem; color: #a8b1bf; margin-top: 2px; }
 .thr-svg { width: 54px; height: 54px; flex-shrink: 0; }
-.desk-panel {
-    border: 1px solid rgba(148, 163, 184, 0.22);
-    border-radius: 14px;
-    background: linear-gradient(165deg, rgba(15, 23, 42, 0.88), rgba(2, 6, 23, 0.94));
-    box-shadow: 0 10px 28px rgba(2, 6, 23, 0.5);
-    padding: 14px 14px 12px;
-    margin-bottom: 12px;
-}
-.desk-section-title {
-    font-size: 0.72rem;
-    color: #94a3b8;
-    text-transform: uppercase;
-    letter-spacing: .08em;
-    margin: 0 0 10px 2px;
-}
-.desk-grid {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(140px, 1fr));
-    gap: 10px;
-}
-.desk-card {
-    border: 1px solid rgba(148, 163, 184, 0.2);
-    border-radius: 12px;
-    padding: 12px 14px;
-    background: rgba(15, 23, 42, 0.55);
-    min-height: 96px;
-}
-.desk-card.pos { border-color: rgba(34, 197, 94, 0.45); background: rgba(34, 197, 94, 0.08); }
-.desk-card.neg { border-color: rgba(239, 68, 68, 0.45); background: rgba(239, 68, 68, 0.08); }
-.desk-card.side-long { border-color: rgba(34, 197, 94, 0.5); }
-.desk-card.side-short { border-color: rgba(239, 68, 68, 0.5); }
-.desk-title { font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; letter-spacing: .06em; }
-.desk-odo {
-    font-size: 1.45rem;
-    font-weight: 800;
-    margin-top: 6px;
-    font-variant-numeric: tabular-nums;
-    line-height: 1.1;
-}
-.desk-odo.pos { color: #22c55e; }
-.desk-odo.neg { color: #ef4444; }
-.desk-odo.neutral { color: #f8fafc; }
-.desk-odo.long { color: #22c55e; }
-.desk-odo.short { color: #ef4444; }
-.desk-sub { font-size: 0.76rem; color: #a8b1bf; margin-top: 6px; }
-.desk-empty {
-    border: 1px dashed rgba(148, 163, 184, 0.35);
-    border-radius: 10px;
-    padding: 14px;
-    color: #94a3b8;
-    font-size: 0.86rem;
-    text-align: center;
-}
 .log-wrap {
     border: 1px solid rgba(148, 163, 184, 0.22);
     border-radius: 12px;
@@ -469,9 +490,14 @@ def _odo_card(
 def _odo_panel_html(sections: list[str], height: int) -> None:
     body = "".join(sections)
     panel = f"""
+    <style>{DESK_PANEL_CSS}</style>
     <div class="desk-panel">{body}</div>
     <script>
     (function() {{
+      function setFrameHeight() {{
+        const h = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+        window.parent.postMessage({{type: "streamlit:setFrameHeight", height: h}}, "*");
+      }}
       function fmt(v, d, prefix, suffix, signed) {{
         const n = Number(v);
         const sign = signed && n > 0 ? "+" : "";
@@ -500,6 +526,9 @@ def _odo_panel_html(sections: list[str], height: int) -> None:
         }}
         requestAnimationFrame(tick);
       }});
+      setFrameHeight();
+      window.addEventListener("load", setFrameHeight);
+      setTimeout(setFrameHeight, 950);
     }})();
     </script>
     """
@@ -617,12 +646,11 @@ def render_compound_and_position(
                 card_cls=pct_tone,
             )
         )
-        sections.append(f'<div class="desk-grid" style="grid-template-columns:repeat(6,minmax(120px,1fr));">{position_cards}</div>')
+        sections.append(f'<div class="desk-grid six">{position_cards}</div>')
         sections.append(f'<div class="desk-sub" style="margin:10px 2px 0;">{html.escape(footer)}</div>')
 
-    row_count = 2 if comp is not None else 1
-    has_position = exchange_pos and exchange_pos.get("status") not in (None, "flat", "error")
-    height = 120 + (row_count - 1) * 118 + (118 if has_position else 52)
+    has_position = bool(exchange_pos and exchange_pos.get("status") not in (None, "flat", "error"))
+    height = 300 if comp is not None and has_position else (220 if has_position else 180)
     _odo_panel_html(sections, height=height)
 
 
