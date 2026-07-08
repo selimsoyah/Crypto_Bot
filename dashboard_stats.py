@@ -66,7 +66,14 @@ def reconcile_manual_exchange_close(
             return result
 
     if client is None:
-        client = exchange_client.build_execution_client()
+        try:
+            client = exchange_client.build_execution_client()
+        except Exception as exc:
+            result["message"] = (
+                "Manual close reconciliation unavailable: "
+                f"{config.sanitize_for_log(str(exc))}"
+            )
+            return result
     try:
         fills = exchange_client.call_with_retry(
             client.futures_account_trades,
@@ -306,7 +313,13 @@ def fetch_live_position(
     if not config.credentials_present():
         return {"status": "error", "message": "API credentials not configured."}
     if client is None:
-        client = exchange_client.build_execution_client()
+        try:
+            client = exchange_client.build_execution_client()
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": config.sanitize_for_log(str(exc)),
+            }
     try:
         rows = exchange_client.call_with_retry(
             client.futures_position_information,

@@ -1,4 +1,4 @@
 {
-  "long_threshold": 0.40,
-  "short_threshold": 0.51
+  "long_threshold": 0.78,
+  "short_threshold": 0.6
 }

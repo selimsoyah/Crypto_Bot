@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import os
 from typing import Optional
 
@@ -25,16 +26,82 @@ st.markdown(
 .metric-card {
     border: 1px solid rgba(148, 163, 184, 0.25);
     border-radius: 12px;
-    padding: 12px 14px;
-    background: rgba(15, 23, 42, 0.45);
+    padding: 14px 16px;
+    background: linear-gradient(160deg, rgba(15, 23, 42, 0.82), rgba(2, 6, 23, 0.9));
     min-height: 110px;
+    box-shadow: 0 8px 20px rgba(2, 6, 23, 0.45);
 }
 .metric-title {font-size: 0.78rem; color: #94a3b8; text-transform: uppercase; letter-spacing: .06em;}
-.metric-value {font-size: 1.5rem; font-weight: 700; margin-top: 2px;}
+.metric-value {font-size: 1.6rem; font-weight: 800; margin-top: 4px; font-variant-numeric: tabular-nums;}
 .metric-sub {font-size: 0.82rem; color: #a8b1bf; margin-top: 4px;}
 .pos { color: #22c55e; }
 .neg { color: #ef4444; }
 .subtle { color: #94a3b8; }
+.good { color: #22c55e; }
+.warn { color: #f59e0b; }
+.bad  { color: #ef4444; }
+.thr-wrap {
+    border: 1px solid rgba(148, 163, 184, 0.20);
+    border-radius: 12px;
+    background: linear-gradient(160deg, rgba(15, 23, 42, 0.72), rgba(2, 6, 23, 0.8));
+    box-shadow: 0 8px 20px rgba(2, 6, 23, 0.35);
+    padding: 10px 8px;
+    margin-bottom: 10px;
+}
+.thr-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(120px, 1fr));
+    gap: 8px;
+}
+.thr-card {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    border-radius: 10px;
+    padding: 8px;
+    background: rgba(15, 23, 42, 0.45);
+}
+.thr-title { font-size: 0.68rem; color: #94a3b8; text-transform: uppercase; letter-spacing: .06em; }
+.thr-val { font-size: 1rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.thr-sub { font-size: 0.70rem; color: #a8b1bf; margin-top: 2px; }
+.thr-svg { width: 54px; height: 54px; flex-shrink: 0; }
+.log-wrap {
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    border-radius: 12px;
+    overflow: hidden;
+    background: rgba(2, 6, 23, 0.45);
+}
+.log-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+    font-variant-numeric: tabular-nums;
+}
+.log-table th {
+    text-align: left;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: #94a3b8;
+    background: rgba(15, 23, 42, 0.9);
+    padding: 8px 10px;
+}
+.log-table td {
+    padding: 8px 10px;
+    border-top: 1px solid rgba(148, 163, 184, 0.14);
+}
+.row-good td { color: #22c55e; }
+.row-warn td { color: #f59e0b; }
+.row-bad  td { color: #ef4444; }
+.row-live td {
+    color: #22c55e;
+    animation: liveBlink 1.1s ease-in-out infinite;
+}
+@keyframes liveBlink {
+    0%, 100% { background: rgba(34, 197, 94, 0.06); }
+    50% { background: rgba(34, 197, 94, 0.25); }
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -59,7 +126,10 @@ def get_store():
 
 @st.cache_resource(show_spinner=False)
 def _futures_client():
-    return exchange_client.build_execution_client()
+    try:
+        return exchange_client.build_execution_client()
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=max(1, REFRESH_MS // 1000), show_spinner=False)
@@ -101,6 +171,13 @@ def load_trades() -> pd.DataFrame:
     except Exception as exc:
         st.sidebar.error(f"Could not read trades ledger: {exc}")
         return pd.DataFrame()
+
+
+def get_live_thresholds() -> tuple[float, float, str]:
+    """Thresholds the bot actually trades with (same resolver as bot_loop)."""
+    from bot_loop import resolve_live_thresholds
+
+    return resolve_live_thresholds()
 
 
 @st.cache_resource(show_spinner=False)
@@ -221,12 +298,11 @@ def render_top_metrics(metrics: dict) -> None:
     net = metrics["net_pnl"]
     open_pnl = metrics["open_pnl"]
     wr = metrics["win_rate"]
-
     c1, c2, c3, c4 = st.columns(4, gap="small")
     with c1:
         st.markdown(
             f'<div class="metric-card"><div class="metric-title">Wallet</div>'
-            f'<div class="metric-value">${wallet:,.2f}</div>'
+            f'<div class="metric-value pos">${wallet:,.2f}</div>'
             f'<div class="metric-sub">USDT margin</div></div>',
             unsafe_allow_html=True,
         )
@@ -240,7 +316,7 @@ def render_top_metrics(metrics: dict) -> None:
             unsafe_allow_html=True,
         )
     with c3:
-        cls = "pos" if open_pnl >= 0 else ("neg" if open_pnl < 0 else "subtle")
+        cls = "pos" if open_pnl >= 0 else "neg"
         sign = "+" if open_pnl >= 0 else ""
         st.markdown(
             f'<div class="metric-card"><div class="metric-title">Open PnL</div>'
@@ -256,6 +332,40 @@ def render_top_metrics(metrics: dict) -> None:
             f'<div class="metric-sub">{metrics["wins"]}W / {metrics["losses"]}L</div></div>',
             unsafe_allow_html=True,
         )
+
+
+def _circle_card(label: str, value: float, threshold: float, color: str) -> str:
+    pct = max(0.0, min(100.0, value * 100.0))
+    circ = 2 * 3.14159 * 20
+    offset = circ * (1 - pct / 100.0)
+    return (
+        f'<div class="thr-card">'
+        f'<svg class="thr-svg" viewBox="0 0 54 54">'
+        f'<circle cx="27" cy="27" r="20" stroke="rgba(148,163,184,0.30)" stroke-width="5" fill="none"></circle>'
+        f'<circle cx="27" cy="27" r="20" stroke="{color}" stroke-width="5" fill="none" '
+        f'stroke-linecap="round" transform="rotate(-90 27 27)" '
+        f'stroke-dasharray="{circ:.2f}" stroke-dashoffset="{offset:.2f}"></circle>'
+        f'<text x="27" y="31" text-anchor="middle" fill="{color}" style="font-size:10px;font-weight:700">{pct:.0f}%</text>'
+        f'</svg>'
+        f'<div><div class="thr-title">{html.escape(label)}</div>'
+        f'<div class="thr-val" style="color:{color}">{pct:.1f}%</div>'
+        f'<div class="thr-sub">thr {threshold*100:.1f}%</div></div>'
+        f'</div>'
+    )
+
+
+def render_threshold_circles(stats: dict) -> None:
+    long_thr, short_thr, thr_source = get_live_thresholds()
+    cards_html = (
+        _circle_card("Long", float(stats.get("prob_long", 0.0)), long_thr, "#22c55e")
+        + _circle_card("Short", float(stats.get("prob_short", 0.0)), short_thr, "#ef4444")
+        + _circle_card("Cash", float(stats.get("prob_cash", 0.0)), 0.0, "#f59e0b")
+    )
+    st.markdown(
+        f'<div class="thr-wrap"><div class="thr-title" style="margin-bottom:6px;">Live Thresholds · {html.escape(thr_source)}</div>'
+        f'<div class="thr-grid">{cards_html}</div></div>',
+        unsafe_allow_html=True,
+    )
 
 
 def render_position_panel(exchange_pos: Optional[dict], bot=None) -> None:
@@ -290,7 +400,33 @@ def render_activity(log_df: pd.DataFrame) -> None:
     if not rows:
         st.info("No activity rows yet.")
         return
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=350)
+    body = []
+    for r in rows:
+        reason = html.escape(str(r.get("reason", "")))
+        action = html.escape(str(r.get("action", "")))
+        tone = str(r.get("tone", "info"))
+        if "ERROR" in action or "FAILED" in action:
+            cls = "row-bad"
+        elif tone == "warn":
+            cls = "row-warn"
+        else:
+            cls = "row-good"
+        body.append(
+            "<tr class='%s'><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+            % (
+                cls,
+                html.escape(str(r.get("time", ""))),
+                action,
+                html.escape(str(r.get("position", ""))),
+                reason,
+            )
+        )
+    st.markdown(
+        "<div class='log-wrap'><table class='log-table'>"
+        "<thead><tr><th>Time</th><th>Action</th><th>Pos</th><th>Detail</th></tr></thead>"
+        f"<tbody>{''.join(body)}</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
 
 
 def render_closed_trades(trades_df: pd.DataFrame, exchange_pos: Optional[dict]) -> None:
@@ -302,7 +438,34 @@ def render_closed_trades(trades_df: pd.DataFrame, exchange_pos: Optional[dict]) 
     if not rows:
         st.info("No trades yet.")
         return
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=350)
+    table = []
+    for idx, r in enumerate(rows):
+        is_live = bool(r.get("open"))
+        if is_live:
+            cls = "row-live"
+            status = "OPEN"
+        else:
+            cls = "row-good" if bool(r.get("won")) else "row-bad"
+            status = html.escape(str(r.get("status", "")))
+        table.append(
+            "<tr class='%s'><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+            % (
+                cls,
+                html.escape(str(r.get("time", ""))),
+                html.escape(str(r.get("side", ""))),
+                f'{float(r.get("entry", 0.0)):,.2f}',
+                f'{float(r.get("exit", 0.0)):,.2f}',
+                html.escape(str(r.get("sh", ""))),
+                status,
+                f'{float(r.get("pnl", 0.0)):+.2f}',
+            )
+        )
+    st.markdown(
+        "<div class='log-wrap'><table class='log-table'>"
+        "<thead><tr><th>Time</th><th>Side</th><th>Entry</th><th>Exit</th><th>SH</th><th>Status</th><th>PnL</th></tr></thead>"
+        f"<tbody>{''.join(table)}</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
 
 
 def render_sidebar_controls(bot):
@@ -420,6 +583,14 @@ render_venue_banner()
 log_df = load_log()
 trades_df = load_trades()
 exchange_pos = fetch_live_position()
+if (
+    exchange_pos.get("status") == "error"
+    and "No module named 'binance'" in str(exchange_pos.get("message", ""))
+):
+    st.warning(
+        "Exchange client dependency missing in this Python environment. "
+        "Install with: `pip install -r requirements.txt` (or `pip install python-binance`)."
+    )
 
 recon = dashboard_stats.reconcile_manual_exchange_close(
     store=get_store(),
@@ -448,6 +619,7 @@ st.info(
 st.caption(health["detail"])
 
 metrics = dashboard_stats.essential_metrics(trades_df, log_df, exchange_pos=exchange_pos, bot=bot)
+render_threshold_circles(stats)
 render_top_metrics(metrics)
 
 if config.is_compound_profile():
@@ -470,10 +642,7 @@ st.subheader("Chart")
 render_tradingview(symbol="BINANCE:BTCUSDT.P", height=480)
 
 with st.expander("Model thresholds & probabilities", expanded=False):
-    long_thr, short_thr, thr_source = get_live_thresholds()
-    st.caption(f"Thresholds: {thr_source}")
-    st.progress(stats["prob_long"], text=f"LONG {stats['prob_long'] * 100:.1f}% (thr {long_thr:.0%})")
-    st.progress(stats["prob_short"], text=f"SHORT {stats['prob_short'] * 100:.1f}% (thr {short_thr:.0%})")
+    render_threshold_circles(stats)
 
 st.caption(
     f"Auto-refresh: {'on' if _AUTOREFRESH else 'manual'} · "

@@ -154,3 +154,4 @@ the bot.
 your Futures Testnet USDT wallet accordingly.
 - **Live auto-refresh**: install `streamlit-autorefresh` (already in
 `requirements.txt`); otherwise use the sidebar **Manual Refresh** button.
+
