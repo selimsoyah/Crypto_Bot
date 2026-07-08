@@ -960,10 +960,20 @@ def render_sidebar_controls(
                 st.error("Refused to boot: type LIVE to confirm mainnet execution.")
             elif engine_status.get("running"):
                 st.info("Engine is already running.")
+            elif engine_status.get("booting"):
+                st.info("Engine is booting — status will update shortly.")
             elif engine_status.get("systemd_available"):
                 ok, msg = bot_runtime.start_engine_service()
                 if ok:
-                    st.success("Headless engine boot initiated via systemd.")
+                    booted = bot_runtime.wait_for_engine_start()
+                    if booted:
+                        st.success("Engine is online.")
+                    else:
+                        st.warning(
+                            "Engine start requested but no live heartbeat yet. "
+                            "Check `sudo journalctl -u crypto-bot -n 40`."
+                        )
+                    st.rerun()
                 else:
                     st.error(msg)
             else:
@@ -980,14 +990,20 @@ def render_sidebar_controls(
                 st.warning("Engine is already offline.")
 
         running = bool(engine_status.get("running"))
+        booting = bool(engine_status.get("booting"))
         mode = str(engine_status.get("mode", "offline"))
         pid = int(engine_status.get("pid", 0) or 0)
         if running:
             st.success(f"ENGINE RUNNING ({mode}, pid {pid})")
+        elif booting:
+            st.warning(f"ENGINE BOOTING ({mode})")
         elif engine_status.get("process_alive"):
             st.warning("ENGINE STALE (process alive, heartbeat delayed)")
         else:
             st.error("ENGINE OFFLINE")
+            service_state = str(engine_status.get("service_state", "") or "")
+            if service_state == "failed":
+                st.caption("crypto-bot service failed — inspect journalctl logs.")
 
         if engine_status.get("degraded"):
             st.warning(

@@ -756,7 +756,10 @@ def bot_health(
     mode = str(runtime.get("mode", "offline"))
     pid = int(runtime.get("pid", 0) or 0)
     if not running:
-        if runtime.get("process_alive") and stale:
+        if runtime.get("booting"):
+            status = "BOOTING"
+            detail = "Engine service is starting — waiting for first scan."
+        elif runtime.get("process_alive") and stale:
             status = "STALE"
             detail = "Engine process is alive but heartbeat is stale — check logs."
         else:

@@ -2039,6 +2039,7 @@ class TradingBot:
         self._log_status(self.state.last_price or 0.0)
 
     def _run(self) -> None:
+        self._write_runtime_snapshot()
         try:
             try:
                 self._connect()

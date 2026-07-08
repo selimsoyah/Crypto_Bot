@@ -10,6 +10,29 @@ import bot_runtime
 import config
 
 
+def test_engine_runtime_status_live_from_fresh_log_only(tmp_path, monkeypatch):
+    import bot_runtime as br
+
+    monkeypatch.setattr(config, "LOOP_SLEEP_SECONDS", 5)
+    now = datetime.now(timezone.utc)
+    log = pd.DataFrame(
+        {
+            "Timestamp": [now.strftime("%Y-%m-%d %H:%M:%S")],
+            "Action": ["HOLD"],
+            "Event": ["SCAN"],
+            "Open_Position": ["FLAT"],
+        }
+    )
+    monkeypatch.setattr(br, "read_lock_pid", lambda: 0)
+    monkeypatch.setattr(br, "read_runtime_snapshot", lambda: {})
+    monkeypatch.setattr(br, "systemd_unit_available", lambda: True)
+    monkeypatch.setattr(br, "systemd_service_state", lambda: "active")
+
+    status = br.engine_runtime_status(log)
+    assert status["running"] is True
+    assert status["stale"] is False
+
+
 def test_engine_runtime_status_live_from_snapshot_and_log(tmp_path, monkeypatch):
     db_dir = tmp_path
     monkeypatch.setattr(config, "BASE_DIR", db_dir)
