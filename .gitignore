@@ -25,6 +25,7 @@ htmlcov/
 *.db-shm
 .bot_*
 .bot_instance.lock
+.bot_runtime_snapshot.json
 bot_status_log.csv
 
 # Regenerable data & model artifacts (see data_pipeline.py / model_brain.py)

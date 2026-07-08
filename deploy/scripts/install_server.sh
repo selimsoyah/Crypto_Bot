@@ -32,11 +32,16 @@ chmod 600 .env 2>/dev/null || true
 
 mkdir -p session_exports
 
-echo "==> Installing systemd service (dashboard auto-start on boot)..."
+echo "==> Installing systemd services (dashboard + headless engine)..."
 sudo cp deploy/systemd/crypto-bot-dashboard.service /etc/systemd/system/
+sudo cp deploy/systemd/crypto-bot.service /etc/systemd/system/
 sudo sed -i "s|/home/ubuntu|$HOME|g" /etc/systemd/system/crypto-bot-dashboard.service
+sudo sed -i "s|/home/ubuntu|$HOME|g" /etc/systemd/system/crypto-bot.service
+sudo cp deploy/sudoers/crypto-bot-dashboard /etc/sudoers.d/crypto-bot-dashboard
+sudo chmod 440 /etc/sudoers.d/crypto-bot-dashboard
 sudo systemctl daemon-reload
 sudo systemctl enable crypto-bot-dashboard.service
+sudo systemctl enable crypto-bot.service
 
 echo "==> Firewall: allow SSH only (dashboard accessed via SSH tunnel)..."
 sudo ufw default deny incoming
@@ -49,5 +54,6 @@ echo "==> Install complete."
 echo "Next steps:"
 echo "  1. Edit ~/Crypto_Bot/.env with your TESTNET API keys"
 echo "  2. sudo systemctl start crypto-bot-dashboard"
-echo "  3. From your PC: bash deploy/scripts/open_dashboard.sh ubuntu@YOUR_SERVER_IP"
-echo "  4. Open http://localhost:8501 and click BOOT BOT ENGINE"
+echo "  3. sudo systemctl start crypto-bot"
+echo "  4. From your PC: bash deploy/scripts/open_dashboard.sh ubuntu@YOUR_SERVER_IP"
+echo "  5. Open http://localhost:8501 (engine status syncs from headless service)"

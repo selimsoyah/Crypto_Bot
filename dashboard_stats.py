@@ -562,6 +562,7 @@ def essential_metrics(
     log: pd.DataFrame,
     exchange_pos: Optional[dict] = None,
     bot=None,
+    runtime_snapshot: Optional[dict] = None,
 ) -> dict:
     """Minimal headline stats for the redesigned dashboard."""
     closed = compute_closed_trade_stats(trades)
@@ -576,6 +577,8 @@ def essential_metrics(
     wallet = 0.0
     if bot is not None and bot.state.running and bot.state.usdt_balance > 0:
         wallet = float(bot.state.usdt_balance)
+    elif runtime_snapshot and float(runtime_snapshot.get("usdt_balance", 0.0) or 0.0) > 0:
+        wallet = float(runtime_snapshot.get("usdt_balance", 0.0))
     elif not log.empty:
         wallet = float(log.iloc[-1].get("Current_Balance", 0.0) or 0.0)
 
@@ -600,6 +603,7 @@ def essential_metrics(
 def compute_compound_metrics(
     trades: pd.DataFrame,
     bot=None,
+    runtime_snapshot: Optional[dict] = None,
     lookback_days: int = 7,
 ) -> dict:
     """Path B compounding stats — expectancy, weekly activity, streak sizing."""
@@ -638,10 +642,17 @@ def compute_compound_metrics(
     size_mult = 1.0
     consecutive_wins = 0
     consecutive_losses = 0
-    if bot is not None:
+    risk = {}
+    if isinstance(runtime_snapshot, dict):
+        risk = runtime_snapshot.get("risk", {}) if isinstance(runtime_snapshot.get("risk"), dict) else {}
+    if risk:
+        consecutive_wins = int(risk.get("consecutive_wins", 0) or 0)
+        consecutive_losses = int(risk.get("consecutive_losses", 0) or 0)
+    elif bot is not None:
         snap = bot.risk.snapshot()
         consecutive_wins = snap.consecutive_wins
         consecutive_losses = snap.consecutive_losses
+    if consecutive_wins or consecutive_losses or bot is not None:
         from compound_strategy import compound_size_multiplier
 
         size_mult = compound_size_multiplier(consecutive_wins, consecutive_losses)
@@ -696,15 +707,26 @@ def bot_health(
     bot,
     log: pd.DataFrame,
     exchange_pos: Optional[dict] = None,
+    runtime: Optional[dict] = None,
 ) -> dict:
     """Heartbeat snapshot — is the engine alive and scanning?"""
-    running = bool(bot is not None and bot.state.running)
-    degraded = bool(bot is not None and bot.state.connection_degraded)
+    import bot_runtime
+
+    runtime = runtime or bot_runtime.engine_runtime_status(log)
+    running = bool(runtime.get("running"))
+    degraded = bool(runtime.get("degraded"))
+    if not running and bot is not None and getattr(bot.state, "running", False):
+        running = True
+        degraded = bool(getattr(bot.state, "connection_degraded", False))
+        if degraded:
+            runtime = dict(runtime)
+            runtime["connection_error"] = str(getattr(bot.state, "connection_error", "") or "")
+    snapshot = runtime.get("snapshot", {}) or {}
     last_action = "—"
     last_event = "—"
     last_scan_str = "never"
-    seconds_ago: Optional[float] = None
-    stale = True
+    seconds_ago: Optional[float] = runtime.get("heartbeat_age")
+    stale = bool(runtime.get("stale", True))
     open_position = "FLAT"
     position_source = "log"
 
@@ -718,49 +740,48 @@ def bot_health(
         if pd.notna(last_scan):
             if last_scan.tzinfo is None:
                 last_scan = last_scan.tz_localize("UTC")
-            now = pd.Timestamp.now(tz="UTC")
-            seconds_ago = max(0.0, (now - last_scan).total_seconds())
+            if seconds_ago is None:
+                now = pd.Timestamp.now(tz="UTC")
+                seconds_ago = max(0.0, (now - last_scan).total_seconds())
             last_scan_str = last_scan.strftime("%H:%M:%S UTC")
-            stale_threshold = max(30.0, config.LOOP_SLEEP_SECONDS * 4)
-            stale = seconds_ago > stale_threshold
+
+    pos = snapshot.get("position", {}) if isinstance(snapshot.get("position"), dict) else {}
+    if running and pos.get("side") not in (None, "", "FLAT"):
+        open_position = str(pos.get("side", open_position))
 
     if exchange_pos and exchange_pos.get("status") == "ok":
         open_position = str(exchange_pos.get("side", open_position))
         position_source = "exchange"
 
+    mode = str(runtime.get("mode", "offline"))
+    pid = int(runtime.get("pid", 0) or 0)
     if not running:
-        status = "OFFLINE"
-        detail = "Boot the engine from the sidebar to start scanning."
+        if runtime.get("process_alive") and stale:
+            status = "STALE"
+            detail = "Engine process is alive but heartbeat is stale — check logs."
+        else:
+            status = "OFFLINE"
+            detail = "Boot the engine from the sidebar to start scanning."
     elif degraded:
         status = "DEGRADED"
-        detail = bot.state.connection_error or "Exchange API issues — entries paused."
+        detail = runtime.get("connection_error") or "Exchange API issues — entries paused."
     elif running and log.empty:
-        started = getattr(bot, "_session_started_at", None)
-        boot_grace = max(30.0, config.LOOP_SLEEP_SECONDS * 4)
-        if started is not None:
-            now = pd.Timestamp.now(tz="UTC")
-            if started.tzinfo is None:
-                started = started.replace(tzinfo=timezone.utc)
-            secs_since_boot = max(0.0, (now - started).total_seconds())
-            if secs_since_boot <= boot_grace:
-                status = "BOOTING"
-                detail = "Engine started — waiting for first scan to complete."
-                stale = False
-            else:
-                status = "STALE"
-                detail = "No status rows written — check bot thread for errors."
-        else:
-            status = "STALE"
-            detail = "No status log rows yet — check bot thread."
+        status = "BOOTING"
+        detail = "Engine started — waiting for first scan to complete."
+        stale = False
     elif stale:
         status = "STALE"
         if seconds_ago is not None:
-            detail = f"No log update in {int(seconds_ago)}s — check bot thread."
+            detail = f"No heartbeat in {int(seconds_ago)}s — check engine logs."
         else:
             detail = "No status log rows yet — check bot thread."
     else:
         status = "LIVE"
-        detail = f"Scanning every {config.LOOP_SLEEP_SECONDS}s · last action {last_action}"
+        mode_label = "systemd" if mode == "systemd" else "headless"
+        detail = (
+            f"{mode_label} engine pid {pid} · scanning every {config.LOOP_SLEEP_SECONDS}s · "
+            f"last action {last_action}"
+        )
 
     mismatch = position_mismatch_warning(log, exchange_pos)
     if mismatch and status in ("OFFLINE", "STALE"):
@@ -778,10 +799,16 @@ def bot_health(
         "open_position": open_position,
         "position_source": position_source,
         "detail": detail,
+        "mode": mode,
+        "pid": pid,
     }
 
 
-def darvas_box_stats(candles: pd.DataFrame | None, bot=None) -> dict:
+def darvas_box_stats(
+    candles: pd.DataFrame | None,
+    bot=None,
+    runtime: Optional[dict] = None,
+) -> dict:
     """Return active Darvas box boundaries for dashboard display."""
     empty = {
         "valid": False,
@@ -794,6 +821,22 @@ def darvas_box_stats(candles: pd.DataFrame | None, bot=None) -> dict:
         "prev_day": "",
         "reason": "No box data available.",
     }
+
+    snapshot = (runtime or {}).get("snapshot", {}) if runtime else {}
+    box = snapshot.get("box", {}) if isinstance(snapshot.get("box"), dict) else {}
+    if box.get("valid"):
+        return {
+            "valid": True,
+            "active_box_number": int(box.get("active_box_number", 0)),
+            "box_top": float(box.get("box_top", 0.0)),
+            "box_bottom": float(box.get("box_bottom", 0.0)),
+            "middle_line": float(box.get("middle_line", 0.0)),
+            "box_height": float(box.get("box_height", 0.0)),
+            "breakout": str(box.get("breakout", "CASH")).upper(),
+            "prev_day": str(box.get("prev_day", "")),
+            "reason": str(box.get("reason", "")),
+        }
+
     if bot is not None:
         box = getattr(bot, "_active_box", None)
         if box is not None and getattr(box, "valid", False):

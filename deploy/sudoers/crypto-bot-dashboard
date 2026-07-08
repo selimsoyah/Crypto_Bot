@@ -1,0 +1,2 @@
+# Allow the dashboard user to control the headless engine without a password.
+ubuntu ALL=(ALL) NOPASSWD: /bin/systemctl start crypto-bot, /bin/systemctl stop crypto-bot, /bin/systemctl restart crypto-bot, /bin/systemctl status crypto-bot

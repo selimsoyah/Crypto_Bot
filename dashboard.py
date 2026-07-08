@@ -9,6 +9,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import config
+import bot_runtime
 import dashboard_stats
 import exchange_client
 
@@ -396,20 +397,31 @@ def get_live_thresholds() -> tuple[float, float, str]:
 
 
 @st.cache_resource(show_spinner=False)
-def _bot_singleton() -> tuple:
-    try:
-        from bot_loop import TradingBot
+def get_risk_engine():
+    from risk_engine import RiskEngine
 
-        return TradingBot(), ""
-    except Exception as exc:
-        return None, str(exc)
+    return RiskEngine()
 
 
-def get_bot():
-    bot, err = _bot_singleton()
-    if err:
-        st.session_state.bot_error = err
-    return bot
+def _handle_headless_shutdown() -> None:
+    from bot_loop import recover_orphan_session_export, render_session_report_pdf
+
+    ok, msg = bot_runtime.stop_engine_service()
+    if not ok:
+        st.error(msg)
+        return
+    bot_runtime.wait_for_engine_stop()
+    report = recover_orphan_session_export(get_store())
+    if report is None:
+        st.warning("Engine stopped, but no active session report was found.")
+        return
+    pdf_bytes = render_session_report_pdf(report)
+    ts = report.summary["shutdown_ts"].strftime("%Y-%m-%d_%H%M%S")
+    filename = f"session_summary_{ts}.pdf"
+    st.session_state["pending_session_pdf"] = (pdf_bytes, filename)
+    csv_path = getattr(report, "csv_path", None)
+    csv_name = os.path.basename(csv_path) if csv_path else None
+    st.session_state["shutdown_notice"] = (filename, csv_name)
 
 
 def _auto_download_pdf(pdf_bytes: bytes, filename: str) -> None:
@@ -437,23 +449,6 @@ def _auto_download_pdf(pdf_bytes: bytes, filename: str) -> None:
         """,
         height=0,
     )
-
-
-def _handle_shutdown_with_pdf(bot) -> None:
-    from bot_loop import render_session_report_pdf
-
-    report = bot.stop()
-    if report is None:
-        st.warning("Bot stopped, but no active session was found to report.")
-        return
-    pdf_bytes = render_session_report_pdf(report)
-    ts = report.summary["shutdown_ts"].strftime("%Y-%m-%d_%H%M%S")
-    filename = f"session_summary_{ts}.pdf"
-    st.session_state["pending_session_pdf"] = (pdf_bytes, filename)
-    csv_path = getattr(report, "csv_path", None)
-    csv_name = os.path.basename(csv_path) if csv_path else None
-    st.session_state["shutdown_notice"] = (filename, csv_name)
-    _bot_singleton.clear()
 
 
 def _show_shutdown_notice() -> None:
@@ -508,7 +503,7 @@ def render_venue_banner() -> None:
     st.caption(config.execution_banner_text())
 
 
-def render_profile_badge(bot) -> None:
+def render_profile_badge(box_stats: Optional[dict] = None) -> None:
     active = str(getattr(config, "ACTIVE_PROFILE", "xgboost_ml")).strip()
     title = "Darvas Box Breakout" if active == "darvas_box" else "XGBoost ML Inference"
     st.markdown(
@@ -522,23 +517,23 @@ def render_profile_badge(bot) -> None:
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    box = getattr(bot, "_active_box", None) if bot is not None else None
-    if box is not None and getattr(box, "valid", False):
-        breakout = str(getattr(box, "breakout", "CASH")).upper()
+    box_stats = box_stats or {}
+    if box_stats.get("valid"):
+        breakout = str(box_stats.get("breakout", "CASH")).upper()
         tone = "warn"
         if breakout == "LONG":
             tone = "pos"
         elif breakout == "SHORT":
             tone = "neg"
-        box_id = int(getattr(box, "active_box_number", 0))
-        middle = float(getattr(box, "middle_line", 0.0))
+        box_id = int(box_stats.get("active_box_number", 0))
+        middle = float(box_stats.get("middle_line", 0.0))
         st.markdown(
             "<div class='box-grid'>"
             f"<div class='box-cell'><div class='box-k'>Active Box</div><div class='box-v'>#{box_id}</div></div>"
-            f"<div class='box-cell'><div class='box-k'>Box Top</div><div class='box-v'>{float(getattr(box, 'top', 0.0)):,.2f}</div></div>"
+            f"<div class='box-cell'><div class='box-k'>Box Top</div><div class='box-v'>{float(box_stats.get('box_top', 0.0)):,.2f}</div></div>"
             f"<div class='box-cell'><div class='box-k'>Middle Line</div><div class='box-v'>{middle:,.2f}</div></div>"
-            f"<div class='box-cell'><div class='box-k'>Box Bottom</div><div class='box-v'>{float(getattr(box, 'bottom', 0.0)):,.2f}</div></div>"
-            f"<div class='box-cell'><div class='box-k'>Box Height</div><div class='box-v'>{float(getattr(box, 'height', 0.0)):,.2f}</div></div>"
+            f"<div class='box-cell'><div class='box-k'>Box Bottom</div><div class='box-v'>{float(box_stats.get('box_bottom', 0.0)):,.2f}</div></div>"
+            f"<div class='box-cell'><div class='box-k'>Box Height</div><div class='box-v'>{float(box_stats.get('box_height', 0.0)):,.2f}</div></div>"
             f"<div class='box-cell'><div class='box-k'>Breakout</div><div class='box-v {tone}'>{html.escape(breakout)}</div></div>"
             "</div>"
             f"<div class='profile-sub'>Prev UTC day anchor · RR {config.BOX_RISK_REWARD_RATIO:.2f} · "
@@ -731,7 +726,8 @@ def _odo_panel_html(sections: list[str], height: int) -> None:
 def render_compound_and_position(
     comp: Optional[dict],
     exchange_pos: Optional[dict],
-    bot=None,
+    log_df: Optional[pd.DataFrame] = None,
+    runtime_snapshot: Optional[dict] = None,
 ) -> None:
     sections: list[str] = []
 
@@ -785,9 +781,16 @@ def render_compound_and_position(
         pct_tone = _pnl_tone(pct)
 
         tp = sl = 0.0
-        if bot is not None and bot.state.position is not None:
-            tp = bot.state.position.take_profit_price
-            sl = bot.state.position.stop_loss_price
+        pos = {}
+        if isinstance(runtime_snapshot, dict):
+            pos = runtime_snapshot.get("position", {}) if isinstance(runtime_snapshot.get("position"), dict) else {}
+        if pos.get("tp_price") and pos.get("sl_price"):
+            tp = float(pos.get("tp_price", 0.0) or 0.0)
+            sl = float(pos.get("sl_price", 0.0) or 0.0)
+        elif log_df is not None and not log_df.empty:
+            last = log_df.iloc[-1]
+            tp = float(last.get("TP_Price", 0.0) or 0.0)
+            sl = float(last.get("SL_Price", 0.0) or 0.0)
         footer = (
             f"TP ${tp:,.2f} · SL ${sl:,.2f}"
             if tp and sl
@@ -921,7 +924,12 @@ def render_closed_trades(trades_df: pd.DataFrame, exchange_pos: Optional[dict]) 
     )
 
 
-def render_sidebar_controls(bot, box_stats: Optional[dict] = None):
+def render_sidebar_controls(
+    engine_status: dict,
+    box_stats: Optional[dict] = None,
+):
+    risk_engine = get_risk_engine()
+    risk_flags = bot_runtime.risk_flags_from_runtime(engine_status)
     with st.sidebar:
         st.markdown("## Control")
         st.caption(config.execution_banner_text())
@@ -950,28 +958,44 @@ def render_sidebar_controls(bot, box_stats: Optional[dict] = None):
         if boot:
             if config.execution_is_live() and live_confirm.strip().upper() != "LIVE":
                 st.error("Refused to boot: type LIVE to confirm mainnet execution.")
-            elif bot is not None:
-                if bot.start():
-                    st.success("Engine boot sequence initiated.")
+            elif engine_status.get("running"):
+                st.info("Engine is already running.")
+            elif engine_status.get("systemd_available"):
+                ok, msg = bot_runtime.start_engine_service()
+                if ok:
+                    st.success("Headless engine boot initiated via systemd.")
                 else:
-                    st.error(bot.state.last_error or "Refused to boot.")
+                    st.error(msg)
             else:
-                st.error(st.session_state.get("bot_error", "Bot unavailable."))
+                st.error(
+                    "Headless engine service is not installed. Run "
+                    "`bash deploy/scripts/install_server.sh` on the server."
+                )
 
         if stop:
-            if bot is not None:
-                _handle_shutdown_with_pdf(bot)
+            if engine_status.get("running") or engine_status.get("process_alive"):
+                _handle_headless_shutdown()
                 st.rerun()
             else:
-                st.error("Bot unavailable.")
+                st.warning("Engine is already offline.")
 
-        running = bool(bot and bot.state.running)
-        st.success("ENGINE RUNNING" if running else "ENGINE OFFLINE")
+        running = bool(engine_status.get("running"))
+        mode = str(engine_status.get("mode", "offline"))
+        pid = int(engine_status.get("pid", 0) or 0)
+        if running:
+            st.success(f"ENGINE RUNNING ({mode}, pid {pid})")
+        elif engine_status.get("process_alive"):
+            st.warning("ENGINE STALE (process alive, heartbeat delayed)")
+        else:
+            st.error("ENGINE OFFLINE")
 
-        if bot and bot.state.connection_degraded:
-            st.warning(f"API degraded: {bot.state.connection_error or 'recent failures'}")
-        if bot and bot.state.last_error:
-            st.caption(f"Last error: {bot.state.last_error}")
+        if engine_status.get("degraded"):
+            st.warning(
+                f"API degraded: {engine_status.get('connection_error') or 'recent failures'}"
+            )
+        last_error = str(engine_status.get("last_error", "") or "")
+        if last_error and not running:
+            st.caption(f"Last error: {last_error}")
 
         st.divider()
         st.markdown("### Risk")
@@ -980,14 +1004,11 @@ def render_sidebar_controls(bot, box_stats: Optional[dict] = None):
             f"Max consecutive losses: {config.RISK_MAX_CONSECUTIVE_LOSSES}"
         )
 
-        risk_snap = bot.risk.snapshot() if bot else None
-        kill_file_active = bot.risk.kill_switch_file_active() if bot else os.path.exists(config.KILL_SWITCH_FILE)
-
-        if kill_file_active:
+        if risk_flags["kill_switch_active"]:
             st.error(f"Kill switch ACTIVE ({config.KILL_SWITCH_FILE})")
-        elif risk_snap and risk_snap.halted:
-            st.warning(risk_snap.halt_reason or "Risk engine halted.")
-        elif risk_snap and risk_snap.manual_resume_required:
+        elif risk_flags["halted"]:
+            st.warning(risk_flags["halt_reason"] or "Risk engine halted.")
+        elif risk_flags["manual_resume_required"]:
             st.warning("Consecutive-loss pause — manual resume required.")
         else:
             st.success("Risk gates OK")
@@ -997,30 +1018,19 @@ def render_sidebar_controls(bot, box_stats: Optional[dict] = None):
         clear_kill = k2.button("Clear", use_container_width=True)
 
         if engage_kill:
-            if bot is not None and bot.state.running:
-                bot.activate_kill_switch("Dashboard kill switch engaged")
-                _handle_shutdown_with_pdf(bot)
-                st.rerun()
-            else:
-                from risk_engine import RiskEngine
-
-                RiskEngine().trigger_kill_switch("Dashboard kill switch (engine offline)")
-                st.error("Kill switch file written. Clear it before next boot.")
-                st.rerun()
+            risk_engine.trigger_kill_switch("Dashboard kill switch engaged")
+            if engine_status.get("running") or engine_status.get("process_alive"):
+                _handle_headless_shutdown()
+            st.rerun()
 
         if clear_kill:
-            if bot is not None:
-                bot.clear_kill_switch()
-            else:
-                from risk_engine import RiskEngine
-
-                RiskEngine().clear_kill_switch()
+            risk_engine.clear_kill_switch()
             st.success("Kill switch cleared.")
             st.rerun()
 
-        if risk_snap and risk_snap.manual_resume_required and bot is not None:
+        if risk_flags["manual_resume_required"]:
             if st.button("✅ Confirm Risk Resume", use_container_width=True):
-                st.success(bot.confirm_risk_resume())
+                st.success(risk_engine.confirm_manual_resume().reason)
                 st.rerun()
 
         st.divider()
@@ -1036,24 +1046,32 @@ if st.session_state.get("pending_session_pdf"):
 
 _show_shutdown_notice()
 
-bot = get_bot()
+log_df = load_log()
+trades_df = load_trades()
+engine_status = bot_runtime.engine_runtime_status(log_df)
+runtime_snapshot = engine_status.get("snapshot", {}) or {}
+
 chart_candles = pd.DataFrame()
 darvas_box_stats: dict = {}
 if config.is_darvas_box_profile():
     try:
         chart_candles = load_chart_candles()
-        darvas_box_stats = dashboard_stats.darvas_box_stats(chart_candles, bot=bot)
+        darvas_box_stats = dashboard_stats.darvas_box_stats(
+            chart_candles,
+            runtime=engine_status,
+        )
     except Exception as exc:
         darvas_box_stats = {"valid": False, "reason": f"Could not load box data: {exc}"}
 
-render_sidebar_controls(bot, box_stats=darvas_box_stats if config.is_darvas_box_profile() else None)
+render_sidebar_controls(
+    engine_status=engine_status,
+    box_stats=darvas_box_stats if config.is_darvas_box_profile() else None,
+)
 
 st.title("BTC/USDT ML Futures Desk")
 render_venue_banner()
-render_profile_badge(bot)
+render_profile_badge(darvas_box_stats if config.is_darvas_box_profile() else None)
 
-log_df = load_log()
-trades_df = load_trades()
 exchange_pos = fetch_live_position()
 if (
     exchange_pos.get("status") == "error"
@@ -1083,22 +1101,40 @@ if mismatch:
 for warning in stats.get("data_warnings", []):
     st.warning(warning)
 
-health = dashboard_stats.bot_health(bot, log_df, exchange_pos=exchange_pos)
+health = dashboard_stats.bot_health(
+    None,
+    log_df,
+    exchange_pos=exchange_pos,
+    runtime=engine_status,
+)
 st.info(
     f"Engine: {health['status']} · Last scan: {health['last_scan']} · "
     f"Action: {health['last_action']} · Position: {health['open_position']}"
 )
 st.caption(health["detail"])
 
-metrics = dashboard_stats.essential_metrics(trades_df, log_df, exchange_pos=exchange_pos, bot=bot)
+metrics = dashboard_stats.essential_metrics(
+    trades_df,
+    log_df,
+    exchange_pos=exchange_pos,
+    runtime_snapshot=runtime_snapshot,
+)
 render_threshold_circles(stats)
 render_top_metrics(metrics)
 
 if config.is_compound_profile():
-    comp = dashboard_stats.compute_compound_metrics(trades_df, bot=bot)
+    comp = dashboard_stats.compute_compound_metrics(
+        trades_df,
+        runtime_snapshot=runtime_snapshot,
+    )
 else:
     comp = None
-render_compound_and_position(comp, exchange_pos, bot=bot)
+render_compound_and_position(
+    comp,
+    exchange_pos,
+    log_df=log_df,
+    runtime_snapshot=runtime_snapshot,
+)
 
 left, right = st.columns([1, 1], gap="large")
 with left:

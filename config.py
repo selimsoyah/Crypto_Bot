@@ -374,6 +374,10 @@ KILL_SWITCH_FILE: Final[str] = str(BASE_DIR / _env("KILL_SWITCH_FILE", ".bot_kil
 RISK_MANUAL_RESUME_FILE: Final[str] = str(
     BASE_DIR / _env("RISK_MANUAL_RESUME_FILE", ".bot_risk_manual_resume_required")
 )
+RUNTIME_SNAPSHOT_FILE: Final[str] = str(
+    BASE_DIR / _env("RUNTIME_SNAPSHOT_FILE", ".bot_runtime_snapshot.json")
+)
+BOT_SYSTEMD_UNIT: Final[str] = _env("BOT_SYSTEMD_UNIT", "crypto-bot")
 # Recommendation for initial live period — NOT applied automatically; see Phase 5.
 RISK_RECOMMENDED_LIVE_LEVERAGE: Final[int] = int(_env("RISK_RECOMMENDED_LIVE_LEVERAGE", "2"))
 

@@ -1,0 +1,20 @@
+[Unit]
+Description=Crypto Bot Trading Engine (TESTNET)
+Documentation=file:///home/ubuntu/Crypto_Bot/deploy/ORACLE_DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Crypto_Bot
+Environment=PATH=/home/ubuntu/Crypto_Bot/venv/bin:/usr/bin
+ExecStart=/home/ubuntu/Crypto_Bot/venv/bin/python bot_loop.py
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

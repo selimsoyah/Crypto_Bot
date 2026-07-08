@@ -1885,6 +1885,46 @@ class TradingBot:
         # iteration so the terminal shows exactly one row per discrete event.
         if not self._transition_logged:
             self._log_status(price)
+        self._write_runtime_snapshot()
+
+    def _write_runtime_snapshot(self) -> None:
+        import bot_runtime
+
+        with self.state._lock:
+            pos = self.state.position
+            risk_snap = self.risk.snapshot()
+            payload = {
+                "pid": os.getpid(),
+                "session_id": self.session_id or "",
+                "running": bool(self.state.running),
+                "last_price": float(self.state.last_price or 0.0),
+                "usdt_balance": float(self.state.usdt_balance or 0.0),
+                "connection_degraded": bool(self.state.connection_degraded),
+                "connection_error": str(self.state.connection_error or ""),
+                "last_error": str(self.state.last_error or ""),
+                "signal_direction": str(self.state.signal_direction or "CASH"),
+                "prob_long": float(self.state.prob_long),
+                "prob_short": float(self.state.prob_short),
+                "prob_cash": float(self.state.prob_cash),
+                "last_action": str(self.state.last_action or ""),
+                "last_event": str(self.state.last_event or ""),
+                "active_profile": str(config.ACTIVE_PROFILE),
+                "position": {
+                    "side": pos.side if pos else "FLAT",
+                    "entry_price": float(pos.entry_price) if pos else None,
+                    "tp_price": float(pos.take_profit_price) if pos else None,
+                    "sl_price": float(pos.stop_loss_price) if pos else None,
+                },
+                "box": self._active_box.as_dict() if self._active_box else {},
+                "risk": {
+                    "manual_resume_required": risk_snap.manual_resume_required,
+                    "halted": risk_snap.halted,
+                    "halt_reason": risk_snap.halt_reason,
+                    "consecutive_wins": risk_snap.consecutive_wins,
+                    "consecutive_losses": risk_snap.consecutive_losses,
+                },
+            }
+        bot_runtime.write_runtime_snapshot(payload)
 
     def _cash_reason(self, signal: dict) -> str:
         """Build a verbose explanation for staying in CASH."""
@@ -1990,8 +2030,7 @@ class TradingBot:
                 f"Engine booted — scanning every {config.LOOP_SLEEP_SECONDS}s."
             )
         self._log_status(boot_price)
-
-    def _log_iteration_error(self, exc: str) -> None:
+        self._write_runtime_snapshot()
         """Persist a visible row when an iteration throws (loop stays alive)."""
         with self.state._lock:
             self.state.last_action = "ERROR"
@@ -2057,6 +2096,13 @@ class TradingBot:
                 self._stop_event.wait(config.LOOP_SLEEP_SECONDS)
         finally:
             self.state.running = False
+            try:
+                import bot_runtime
+
+                self._write_runtime_snapshot()
+                bot_runtime.clear_runtime_snapshot()
+            except Exception:
+                pass
             if self._session_armed:
                 logger.info("Trading loop exited — finalizing session export.")
                 self._finalize_session_shutdown(
