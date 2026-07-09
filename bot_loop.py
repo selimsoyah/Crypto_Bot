@@ -55,6 +55,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+import pandas as pd
 import config
 import box_strategy
 import compound_strategy
@@ -757,6 +758,15 @@ class Position:
     peak_unrealized: float = 0.0
     best_price: float = 0.0
     trail_active: bool = False
+    quantity_open: float = 0.0
+    tp1_price: float = 0.0
+    tp2_price: float = 0.0
+    tp1_quantity: float = 0.0
+    runner_quantity: float = 0.0
+    tp1_hit: bool = False
+    split_enabled: bool = False
+    partial_realized_pnl: float = 0.0
+    atr_at_entry: float = 0.0
 
 
 @dataclass
@@ -1049,9 +1059,10 @@ class TradingBot:
         pos = self.state.position
         if pos is None:
             return 0.0
+        qty = pos.quantity_open if pos.quantity_open > 0 else pos.quantity
         if pos.side == "LONG":
-            return (price - pos.entry_price) * pos.quantity
-        return (pos.entry_price - price) * pos.quantity
+            return (price - pos.entry_price) * qty
+        return (pos.entry_price - price) * qty
 
     def _post_sl_entry_blocked(self) -> tuple[bool, str]:
         """Return whether the post-stop-loss bar cooldown is still active."""
@@ -1256,6 +1267,36 @@ class TradingBot:
             config.INTERVAL,
         )
 
+    @staticmethod
+    def _atr14_from_candles(candles) -> float:
+        if candles is None or candles.empty or len(candles) < 20:
+            return 0.0
+        frame = candles.copy()
+        prev_close = frame["Close"].shift(1)
+        tr = (
+            pd.concat(
+                [
+                    frame["High"] - frame["Low"],
+                    (frame["High"] - prev_close).abs(),
+                    (frame["Low"] - prev_close).abs(),
+                ],
+                axis=1,
+            )
+            .max(axis=1)
+            .rolling(14)
+            .mean()
+        )
+        val = tr.iloc[-1]
+        return float(val) if pd.notna(val) and float(val) > 0 else 0.0
+
+    def _risk_pct_with_throttle(self) -> float:
+        losses = int(self.risk.snapshot().consecutive_losses)
+        if losses >= 6:
+            return 0.005
+        if losses >= 3:
+            return 0.01
+        return 0.02
+
     def _open_position(
         self,
         direction: str,
@@ -1316,6 +1357,32 @@ class TradingBot:
         side = "BUY" if direction == "LONG" else "SELL"
         effective_alloc = sizing.base_pct * sizing.vol_scale * 100.0
 
+        atr14 = self._atr14_from_candles(candles)
+        if config.is_darvas_box_profile():
+            if atr14 <= 0:
+                self._reject_entry(direction, probability, "ATR", "ATR(14) unavailable for risk sizing.")
+                return
+            risk_pct = self._risk_pct_with_throttle()
+            risk_cash = max(total_wallet, 0.0) * risk_pct
+            sl_distance = 1.5 * atr14
+            if risk_cash <= 0 or sl_distance <= 0:
+                self._reject_entry(direction, probability, "RISK", "Invalid risk cash or SL distance.")
+                return
+            quantity = self._round_step(risk_cash / sl_distance)
+            if quantity <= 0:
+                self._reject_entry(direction, probability, "SIZE", "Risk-sized quantity rounded to zero.")
+                return
+            notional = quantity * price
+            order_usdt_value = notional / max(float(config.LEVERAGE), 1.0)
+            effective_alloc = risk_pct * 100.0
+            logger.info(
+                "Darvas risk throttle sizing | losses=%d | risk_pct=%.2f%% | qty=%.6f | atr14=%.4f",
+                self.risk.snapshot().consecutive_losses,
+                risk_pct * 100.0,
+                quantity,
+                atr14,
+            )
+
         # --- Blocked: insufficient free margin for allocated slice -------- #
         if available < order_usdt_value:
             reason = (
@@ -1340,15 +1407,16 @@ class TradingBot:
             logger.warning(reason)
             return
 
-        quantity = self._round_step(notional / price)
-        if quantity <= 0:
-            reason = (
-                f"Valid {side} signal ({probability * 100:.1f}%), but the "
-                f"computed size rounds to zero at ${price:,.2f}. Order skipped."
-            )
-            self._set_reason("WARNING", f"BLOCKED_{direction}", reason)
-            logger.warning(reason)
-            return
+        if not config.is_darvas_box_profile():
+            quantity = self._round_step(notional / price)
+            if quantity <= 0:
+                reason = (
+                    f"Valid {side} signal ({probability * 100:.1f}%), but the "
+                    f"computed size rounds to zero at ${price:,.2f}. Order skipped."
+                )
+                self._set_reason("WARNING", f"BLOCKED_{direction}", reason)
+                logger.warning(reason)
+                return
 
         sanity = self.risk.validate_order_sanity(price, quantity, notional)
         if not sanity.allowed:
@@ -1407,6 +1475,30 @@ class TradingBot:
             tp, sl = bracket_override
         else:
             tp, sl = bracket_prices(direction, fill_price, atr_pct)
+        tp1 = tp
+        tp2 = tp
+        split_enabled = False
+        tp1_qty = 0.0
+        runner_qty = quantity
+        if config.is_darvas_box_profile() and candles is not None and self._active_box and self._active_box.valid:
+            box_h = max(self._active_box.height, fill_price * 0.0005)
+            sl = fill_price - (1.5 * atr14) if direction == "LONG" else fill_price + (1.5 * atr14)
+            tp1 = fill_price + box_h if direction == "LONG" else fill_price - box_h
+            rr_distance = 2.0 * abs(fill_price - sl)
+            tp2 = fill_price + rr_distance if direction == "LONG" else fill_price - rr_distance
+            half = self._round_step(quantity * 0.5)
+            min_qty = self._round_step(max(self._step_size, self._min_notional / max(fill_price, 1e-9)))
+            if half > 0 and half >= min_qty and (quantity - half) >= min_qty:
+                tp1_qty = half
+                runner_qty = self._round_step(quantity - half)
+                split_enabled = runner_qty > 0
+            else:
+                logger.warning(
+                    "Split disabled: half-quantity below exchange floor (half=%.6f, min=%.6f).",
+                    half,
+                    min_qty,
+                )
+            tp = tp2
         entry_candle_ts = self._current_candle_ts(candles) if candles is not None else self._now_iso()
 
         floor_note = ""
@@ -1444,11 +1536,18 @@ class TradingBot:
                 side=direction,
                 entry_price=fill_price,
                 quantity=quantity,
+                quantity_open=quantity,
                 entry_time=self._now_iso(),
                 entry_candle_ts=entry_candle_ts,
                 take_profit_price=tp,
                 stop_loss_price=sl,
                 best_price=fill_price,
+                tp1_price=tp1,
+                tp2_price=tp2,
+                tp1_quantity=tp1_qty,
+                runner_quantity=runner_qty,
+                split_enabled=split_enabled,
+                atr_at_entry=atr14,
             )
             self.state.last_action = f"OPEN_{direction}"
             self.state.last_event = event
@@ -1471,6 +1570,45 @@ class TradingBot:
             self.state.last_action = action
             self.state.last_reason = reason
 
+    def _close_partial_position(
+        self,
+        pos: Position,
+        close_qty: float,
+        price: float,
+        *,
+        reason_code: str,
+        book: Optional[order_execution.BookTicker] = None,
+    ) -> bool:
+        side = "SELL" if pos.side == "LONG" else "BUY"
+        qty = self._round_step(close_qty)
+        if qty <= 0:
+            return False
+        order_result = self._execute_maker_limit(side, qty, reduce_only=True, book=book)
+        if not order_result.success:
+            logger.warning("Partial close pending (%s): %s", reason_code, order_result.reason or "not filled")
+            return False
+        fill = order_result.fill_price
+        if pos.side == "LONG":
+            pnl = (fill - pos.entry_price) * qty
+        else:
+            pnl = (pos.entry_price - fill) * qty
+        with self.state._lock:
+            pos.quantity_open = max(0.0, pos.quantity_open - qty)
+            pos.partial_realized_pnl += pnl
+            self.state.realized_pnl += pnl
+            self.state.last_action = f"PARTIAL_{pos.side}_{reason_code}"
+            self.state.last_event = "FILL_SUCCESS"
+            self.state.last_reason = f"Partial {reason_code} filled @ ${fill:,.2f} qty {qty:.6f}"
+        logger.info(
+            "Partial close %s %s qty %.6f @ %.2f pnl %+0.2f",
+            pos.side,
+            reason_code,
+            qty,
+            fill,
+            pnl,
+        )
+        return True
+
     def _close_position(
         self,
         price: float,
@@ -1491,9 +1629,9 @@ class TradingBot:
 
         # Closing a LONG means SELL; closing a SHORT means BUY.
         side = "SELL" if pos.side == "LONG" else "BUY"
-        quantity = self._round_step(pos.quantity)
+        quantity = self._round_step(pos.quantity_open if pos.quantity_open > 0 else pos.quantity)
         if quantity <= 0:
-            quantity = pos.quantity
+            quantity = pos.quantity_open if pos.quantity_open > 0 else pos.quantity
 
         use_maker = config.USE_POST_ONLY_MAKER and not force_market
 
@@ -1531,11 +1669,12 @@ class TradingBot:
             exit_mode = "MARKET"
 
         if pos.side == "LONG":
-            pnl = (fill_price - pos.entry_price) * pos.quantity
+            pnl = (fill_price - pos.entry_price) * quantity
             pct = (fill_price - pos.entry_price) / pos.entry_price * 100.0
         else:  # SHORT profits when price falls
-            pnl = (pos.entry_price - fill_price) * pos.quantity
+            pnl = (pos.entry_price - fill_price) * quantity
             pct = (pos.entry_price - fill_price) / pos.entry_price * 100.0
+        pnl += pos.partial_realized_pnl
 
         if reason_code == "TP":
             event = "FILL_SUCCESS"
@@ -1668,9 +1807,11 @@ class TradingBot:
             pos = self.state.position
             open_status = pos.side if pos else "FLAT"
             if pos and pos.side == "LONG":
-                unrealized = (price - pos.entry_price) * pos.quantity
+                qty = pos.quantity_open if pos.quantity_open > 0 else pos.quantity
+                unrealized = (price - pos.entry_price) * qty
             elif pos and pos.side == "SHORT":
-                unrealized = (pos.entry_price - price) * pos.quantity
+                qty = pos.quantity_open if pos.quantity_open > 0 else pos.quantity
+                unrealized = (pos.entry_price - price) * qty
             else:
                 unrealized = 0.0
             row = StatusRow(
@@ -1777,8 +1918,11 @@ class TradingBot:
             )
             self._active_box = box_state
             direction = "CASH"
-            if box_state.valid and box_state.volume_ok and box_state.breakout in {"LONG", "SHORT"}:
-                direction = box_state.breakout
+            if box_state.valid and box_state.volume_ok and box_state.trend_ok and box_state.adx_ok:
+                if live_price > box_state.top:
+                    direction = "LONG"
+                elif live_price < box_state.bottom:
+                    direction = "SHORT"
                 if self._darvas_consumed_signal_ts == box_state.timestamp:
                     direction = "CASH"
             signal = {
@@ -1792,7 +1936,7 @@ class TradingBot:
                 entry_brackets = self._box_brackets(direction, live_price, box_state)
             logger.info(
                 "BOX SCAN | top %.8f | bottom %.8f | middle %.8f | closed %.8f | live %.8f | "
-                "breakout=%s | volume_ok=%s | signal_bar=%s",
+                "breakout=%s | volume_ok=%s | trend_ok=%s | adx_ok=%s | signal_bar=%s",
                 box_state.top,
                 box_state.bottom,
                 box_state.middle_line,
@@ -1800,6 +1944,8 @@ class TradingBot:
                 live_price,
                 direction,
                 box_state.volume_ok,
+                box_state.trend_ok,
+                box_state.adx_ok,
                 box_state.timestamp,
             )
 
@@ -1837,9 +1983,11 @@ class TradingBot:
             bars_held = self._position_bars_held(pos, candles)
             # Track the best floating PnL seen while the position is open.
             if pos.side == "LONG":
-                floating = (live_price - pos.entry_price) * pos.quantity
+                qty = pos.quantity_open if pos.quantity_open > 0 else pos.quantity
+                floating = (live_price - pos.entry_price) * qty
             else:
-                floating = (pos.entry_price - live_price) * pos.quantity
+                qty = pos.quantity_open if pos.quantity_open > 0 else pos.quantity
+                floating = (pos.entry_price - live_price) * qty
             with self.state._lock:
                 pos.peak_unrealized = max(pos.peak_unrealized, floating)
                 trail_note = " · trail ON" if pos.trail_active else ""
@@ -1859,18 +2007,39 @@ class TradingBot:
                 pos = None
             elif pos is not None:
                 if config.is_darvas_box_profile():
-                    self._trail_stop_from_box(pos, self._active_box or box_strategy.BoxState(valid=False))
+                    if pos.split_enabled and not pos.tp1_hit:
+                        tp1_hit = (live_price >= pos.tp1_price) if pos.side == "LONG" else (live_price <= pos.tp1_price)
+                        if tp1_hit:
+                            if self._close_partial_position(pos, pos.tp1_quantity, live_price, reason_code="TP1"):
+                                pos.tp1_hit = True
+                                pos.stop_loss_price = pos.entry_price
+                                pos.trail_active = True
+                    if pos.split_enabled and pos.tp1_hit:
+                        atr_now = self._atr14_from_candles(candles)
+                        if atr_now > 0:
+                            if pos.side == "LONG":
+                                candidate = live_price - (1.5 * atr_now)
+                                if candidate > pos.stop_loss_price:
+                                    pos.stop_loss_price = candidate
+                            else:
+                                candidate = live_price + (1.5 * atr_now)
+                                if candidate < pos.stop_loss_price:
+                                    pos.stop_loss_price = candidate
+                    else:
+                        self._trail_stop_from_box(pos, self._active_box or box_strategy.BoxState(valid=False))
                 else:
                     compound_strategy.update_trailing_stop(pos, price)
                 if pos.side == "LONG":
-                    if live_price >= pos.take_profit_price:
+                    target = pos.tp2_price if (config.is_darvas_box_profile() and pos.split_enabled) else pos.take_profit_price
+                    if live_price >= target:
                         self._close_position(live_price, reason_code="TP")
                         pos = None
                     elif live_price <= pos.stop_loss_price:
                         self._close_position(live_price, reason_code="SL")
                         pos = None
                 elif pos.side == "SHORT":
-                    if live_price <= pos.take_profit_price:
+                    target = pos.tp2_price if (config.is_darvas_box_profile() and pos.split_enabled) else pos.take_profit_price
+                    if live_price <= target:
                         self._close_position(live_price, reason_code="TP")
                         pos = None
                     elif live_price >= pos.stop_loss_price:
@@ -2020,13 +2189,14 @@ class TradingBot:
         entry_price: float,
         box_state: box_strategy.BoxState,
     ) -> tuple[float, float]:
-        height = max(box_state.height, entry_price * 0.001)
+        atr = max(box_state.atr14, entry_price * 0.001)
+        sl_distance = 1.5 * atr
         if direction == "LONG":
-            sl = box_state.bottom * (1.0 - config.BOX_STOP_BUFFER_PCT)
-            tp = entry_price + (height * config.BOX_RISK_REWARD_RATIO)
+            sl = entry_price - sl_distance
+            tp = entry_price + (2.0 * sl_distance)
         else:
-            sl = box_state.top * (1.0 + config.BOX_STOP_BUFFER_PCT)
-            tp = entry_price - (height * config.BOX_RISK_REWARD_RATIO)
+            sl = entry_price + sl_distance
+            tp = entry_price - (2.0 * sl_distance)
         return tp, sl
 
     def _trail_stop_from_box(self, pos: Position, box_state: box_strategy.BoxState) -> None:

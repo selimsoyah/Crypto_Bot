@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 import config
@@ -31,6 +32,11 @@ class BoxState:
     volume: float = 0.0
     volume_sma20: float = 0.0
     volume_ok: bool = True
+    daily_ema50: float = 0.0
+    daily_adx14: float = 0.0
+    atr14: float = 0.0
+    trend_ok: bool = True
+    adx_ok: bool = True
     breakout: str = "CASH"  # LONG | SHORT | CASH
     timestamp: str = ""
     reason: str = ""
@@ -48,6 +54,11 @@ class BoxState:
             "volume": self.volume,
             "volume_sma20": self.volume_sma20,
             "volume_ok": self.volume_ok,
+            "daily_ema50": self.daily_ema50,
+            "daily_adx14": self.daily_adx14,
+            "atr14": self.atr14,
+            "trend_ok": self.trend_ok,
+            "adx_ok": self.adx_ok,
             "breakout": self.breakout,
             "timestamp": self.timestamp,
             "reason": self.reason,
@@ -65,7 +76,7 @@ class BoxStrategyEngine:
         lookback_candles: int = 20,
         confirmation_candles: int = 3,
         risk_to_reward_ratio: float = 2.0,
-        volume_filter_multiplier: float = 1.2,
+        volume_filter_multiplier: float = 1.5,
     ) -> None:
         self.lookback_candles = max(5, int(lookback_candles))
         self.confirmation_candles = max(1, int(confirmation_candles))
@@ -205,6 +216,70 @@ class BoxStrategyEngine:
         ok = vol > (self.volume_filter_multiplier * vol_sma)
         return ok, vol, vol_sma
 
+    @staticmethod
+    def _daily_ema50(frame: pd.DataFrame, ts: pd.Timestamp) -> float:
+        if frame.empty:
+            return 0.0
+        daily_close = (
+            frame.assign(utc_day=frame["Timestamp"].dt.floor("D"))
+            .groupby("utc_day", observed=True)["Close"]
+            .last()
+            .sort_index()
+        )
+        daily_ema50 = daily_close.ewm(span=50, adjust=False).mean().shift(1)
+        day = pd.Timestamp(ts).floor("D")
+        value = daily_ema50.get(day, np.nan)
+        return float(value) if pd.notna(value) else 0.0
+
+    @staticmethod
+    def _atr14(frame: pd.DataFrame, closed_idx: int) -> float:
+        if frame.empty or closed_idx < 0:
+            return 0.0
+        prev_close = frame["Close"].shift(1)
+        tr = pd.concat(
+            [
+                frame["High"] - frame["Low"],
+                (frame["High"] - prev_close).abs(),
+                (frame["Low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr = tr.rolling(14).mean()
+        value = atr.iloc[closed_idx]
+        return float(value) if pd.notna(value) else 0.0
+
+    @staticmethod
+    def _daily_adx14(frame: pd.DataFrame, ts: pd.Timestamp) -> float:
+        if frame.empty:
+            return 0.0
+        daily = (
+            frame.assign(utc_day=frame["Timestamp"].dt.floor("D"))
+            .groupby("utc_day", observed=True)
+            .agg(day_high=("High", "max"), day_low=("Low", "min"), day_close=("Close", "last"))
+            .sort_index()
+        )
+        prev_close = daily["day_close"].shift(1)
+        plus_dm = (daily["day_high"].diff()).clip(lower=0.0)
+        minus_dm = (-daily["day_low"].diff()).clip(lower=0.0)
+        plus_dm = plus_dm.where(plus_dm > minus_dm, 0.0)
+        minus_dm = minus_dm.where(minus_dm > plus_dm, 0.0)
+        tr = pd.concat(
+            [
+                daily["day_high"] - daily["day_low"],
+                (daily["day_high"] - prev_close).abs(),
+                (daily["day_low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr_n = tr.rolling(14).mean()
+        plus_di = 100.0 * (plus_dm.rolling(14).mean() / atr_n.replace(0, np.nan))
+        minus_di = 100.0 * (minus_dm.rolling(14).mean() / atr_n.replace(0, np.nan))
+        dx = (100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
+        adx14 = dx.rolling(14).mean().shift(1)
+        day = pd.Timestamp(ts).floor("D")
+        value = adx14.get(day, np.nan)
+        return float(value) if pd.notna(value) else 0.0
+
     def evaluate(
         self,
         candles: pd.DataFrame,
@@ -255,19 +330,32 @@ class BoxStrategyEngine:
             )
 
         vol_ok, vol, vol_sma = self._volume_ok(frame, closed_idx)
+        daily_ema50 = self._daily_ema50(frame, ts)
+        daily_adx14 = self._daily_adx14(frame, ts)
+        atr14 = self._atr14(frame, closed_idx)
 
         breakout = "CASH"
+        trend_ok = True
+        adx_ok = daily_adx14 > 20.0
         reason = (
             f"Closed 15m bar inside previous-day box ({bottom:,.2f} - {top:,.2f}) "
             f"anchored from {prev_day.isoformat()} UTC."
         )
         # Strict outer-boundary triggers only — middle_line is never used for entries.
         if close > top:
-            if vol_ok:
+            trend_ok = daily_ema50 > 0 and close > daily_ema50
+            if vol_ok and trend_ok and adx_ok:
                 breakout = "LONG"
                 reason = (
                     f"Closed 15m bar broke above previous-day high: "
                     f"close {close:,.2f} > box_top {top:,.2f}."
+                )
+            elif not adx_ok:
+                reason = f"Long breakout blocked by Daily ADX filter (adx14 {daily_adx14:.2f} <= 20.00)."
+            elif not trend_ok:
+                reason = (
+                    f"Long breakout blocked by Daily EMA50 trend gate "
+                    f"(close {close:,.2f} <= daily_ema50 {daily_ema50:,.2f})."
                 )
             else:
                 reason = (
@@ -275,11 +363,19 @@ class BoxStrategyEngine:
                     f"(close {close:,.2f} > box_top {top:,.2f})."
                 )
         elif close < bottom:
-            if vol_ok:
+            trend_ok = daily_ema50 > 0 and close < daily_ema50
+            if vol_ok and trend_ok and adx_ok:
                 breakout = "SHORT"
                 reason = (
                     f"Closed 15m bar broke below previous-day low: "
                     f"close {close:,.2f} < box_bottom {bottom:,.2f}."
+                )
+            elif not adx_ok:
+                reason = f"Short breakout blocked by Daily ADX filter (adx14 {daily_adx14:.2f} <= 20.00)."
+            elif not trend_ok:
+                reason = (
+                    f"Short breakout blocked by Daily EMA50 trend gate "
+                    f"(close {close:,.2f} >= daily_ema50 {daily_ema50:,.2f})."
                 )
             else:
                 reason = (
@@ -297,6 +393,11 @@ class BoxStrategyEngine:
             volume=vol,
             volume_sma20=vol_sma,
             volume_ok=vol_ok,
+            daily_ema50=daily_ema50,
+            daily_adx14=daily_adx14,
+            atr14=atr14,
+            trend_ok=trend_ok,
+            adx_ok=adx_ok,
             breakout=breakout,
             timestamp=str(ts),
             reason=reason,
