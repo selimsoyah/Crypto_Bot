@@ -190,6 +190,38 @@ def load_historical_data(
     return frame
 
 
+def fetch_previous_utc_day_high_low(
+    symbol: str = config.SYMBOL,
+) -> tuple[float, float, str]:
+    """Return (high, low, prev_day_iso) from the exchange UTC daily candle."""
+    client = _build_client(use_mainnet=config.USE_MAINNET_DATA)
+    raw = _fetch_klines_with_retry(
+        client,
+        label="daily_bounds",
+        symbol=symbol,
+        interval="1d",
+        limit=5,
+    )
+    frame = _parse_klines(raw)
+    if frame.empty:
+        raise ValueError("No daily candles returned for previous-day box bounds.")
+
+    prev_day = datetime.now(timezone.utc).date() - timedelta(days=1)
+    day_start = pd.Timestamp(datetime(prev_day.year, prev_day.month, prev_day.day, tzinfo=timezone.utc))
+    match = frame[frame["Timestamp"] == day_start]
+    if match.empty:
+        match = frame[frame["Timestamp"].dt.date == prev_day]
+    if match.empty:
+        raise ValueError(f"Exchange daily candle missing for previous UTC day {prev_day.isoformat()}.")
+
+    row = match.iloc[-1]
+    top = float(row["High"])
+    bottom = float(row["Low"])
+    if top <= bottom:
+        raise ValueError("Exchange daily candle produced an invalid high/low range.")
+    return top, bottom, prev_day.isoformat()
+
+
 def fetch_latest_candles(
     symbol: str = config.SYMBOL,
     interval: str = config.INTERVAL,

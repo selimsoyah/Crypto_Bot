@@ -831,12 +831,41 @@ class TradingBot:
             volume_filter_multiplier=config.BOX_VOLUME_FILTER_MULTIPLIER,
         )
         self._active_box: Optional[box_strategy.BoxState] = None
+        self._darvas_bounds_cache_day: Optional[str] = None
+        self._darvas_daily_high: Optional[float] = None
+        self._darvas_daily_low: Optional[float] = None
+        self._darvas_consumed_signal_ts: Optional[str] = None
         if not _skip_session_recovery:
             recover_orphan_session_export(self.store)
 
     # ------------------------------------------------------------------ #
     # Setup helpers                                                      #
     # ------------------------------------------------------------------ #
+    def _resolve_darvas_daily_bounds(self) -> tuple[Optional[float], Optional[float]]:
+        today = datetime.now(timezone.utc).date().isoformat()
+        if (
+            self._darvas_bounds_cache_day == today
+            and self._darvas_daily_high is not None
+            and self._darvas_daily_low is not None
+        ):
+            return self._darvas_daily_high, self._darvas_daily_low
+        try:
+            top, bottom, prev_day = data_pipeline.fetch_previous_utc_day_high_low()
+            self._darvas_daily_high = top
+            self._darvas_daily_low = bottom
+            self._darvas_bounds_cache_day = today
+            box_strategy.BoxStrategyEngine.log_box_bounds(
+                top,
+                bottom,
+                prev_day,
+                source="exchange_1d_startup",
+                prev_day_bars=1,
+            )
+            return top, bottom
+        except Exception as exc:
+            logger.warning("Falling back to 15m aggregate bounds — daily fetch failed: %s", exc)
+            return None, None
+
     def _mark_api_success(self) -> None:
         self._api_failures = 0
         with self.state._lock:
@@ -1276,8 +1305,9 @@ class TradingBot:
                 self._set_reason("CASH", "HOLD", reason)
                 return
 
-        cooldown_sleep = 0.5 if config.is_compound_profile() else 1.5
-        time.sleep(cooldown_sleep)
+        cooldown_sleep = 0.0 if config.is_darvas_box_profile() else (0.5 if config.is_compound_profile() else 1.5)
+        if cooldown_sleep > 0:
+            time.sleep(cooldown_sleep)
         total_wallet = self._get_total_wallet_balance()
         available = self._get_usdt_balance()
         sizing = self._compute_order_margin(total_wallet, atr_pct)
@@ -1691,8 +1721,9 @@ class TradingBot:
             return
 
         price = float(candles["Close"].iloc[-1])
-        self.risk.update_last_good_price(price)
-        unrealized = self._current_unrealized(price)
+        live_price = price
+        self.risk.update_last_good_price(live_price)
+        unrealized = self._current_unrealized(live_price)
 
         kill = self.risk.check_kill_switch()
         if not kill.allowed:
@@ -1712,12 +1743,15 @@ class TradingBot:
 
         from feature_factory import compute_live_features
 
-        enriched = compute_live_features(candles)
-        atr_pct = (
-            float(enriched["atr_pct"].dropna().iloc[-1])
-            if not enriched["atr_pct"].dropna().empty
-            else config.RISK_ATR_BASELINE_PCT
-        )
+        if config.is_darvas_box_profile():
+            atr_pct = config.RISK_ATR_BASELINE_PCT
+        else:
+            enriched = compute_live_features(candles)
+            atr_pct = (
+                float(enriched["atr_pct"].dropna().iloc[-1])
+                if not enriched["atr_pct"].dropna().empty
+                else config.RISK_ATR_BASELINE_PCT
+            )
 
         box_state: Optional[box_strategy.BoxState] = None
         entry_brackets: Optional[tuple[float, float]] = None
@@ -1735,9 +1769,18 @@ class TradingBot:
             )
             self._log_directional_signal(signal, direction)
         else:
-            box_state = self._box_engine.evaluate(candles)
+            daily_high, daily_low = self._resolve_darvas_daily_bounds()
+            box_state = self._box_engine.evaluate(
+                candles,
+                daily_high=daily_high,
+                daily_low=daily_low,
+            )
             self._active_box = box_state
-            direction = box_state.breakout if box_state.valid else "CASH"
+            direction = "CASH"
+            if box_state.valid and box_state.volume_ok and box_state.breakout in {"LONG", "SHORT"}:
+                direction = box_state.breakout
+                if self._darvas_consumed_signal_ts == box_state.timestamp:
+                    direction = "CASH"
             signal = {
                 "prob_long": 1.0 if direction == "LONG" else 0.0,
                 "prob_short": 1.0 if direction == "SHORT" else 0.0,
@@ -1746,21 +1789,25 @@ class TradingBot:
             }
             signal_label = "Darvas Box"
             if box_state.valid and direction in {"LONG", "SHORT"}:
-                entry_brackets = self._box_brackets(direction, price, box_state)
+                entry_brackets = self._box_brackets(direction, live_price, box_state)
             logger.info(
-                "BOX SCAN | top %.2f | bottom %.2f | close %.2f | breakout=%s | volume_ok=%s",
+                "BOX SCAN | top %.8f | bottom %.8f | middle %.8f | closed %.8f | live %.8f | "
+                "breakout=%s | volume_ok=%s | signal_bar=%s",
                 box_state.top,
                 box_state.bottom,
-                price,
+                box_state.middle_line,
+                box_state.close,
+                live_price,
                 direction,
                 box_state.volume_ok,
+                box_state.timestamp,
             )
 
         # Balance fetch must stay OUTSIDE state._lock — _get_usdt_balance() updates
         # connection flags via _mark_api_success(), which also acquires the lock.
         usdt_balance = self._get_usdt_balance()
         with self.state._lock:
-            self.state.last_price = price
+            self.state.last_price = live_price
             self.state.prob_long = signal["prob_long"]
             self.state.prob_short = signal["prob_short"]
             self.state.prob_cash = signal["prob_cash"]
@@ -1776,7 +1823,7 @@ class TradingBot:
             elif box_state and box_state.valid:
                 self.state.last_reason = (
                     f"Darvas box active ({box_state.bottom:,.2f} - {box_state.top:,.2f}); "
-                    f"close ${price:,.2f} -> {direction}."
+                    f"closed ${box_state.close:,.2f} / live ${live_price:,.2f} -> {direction}."
                 )
             else:
                 self.state.last_reason = (
@@ -1790,9 +1837,9 @@ class TradingBot:
             bars_held = self._position_bars_held(pos, candles)
             # Track the best floating PnL seen while the position is open.
             if pos.side == "LONG":
-                floating = (price - pos.entry_price) * pos.quantity
+                floating = (live_price - pos.entry_price) * pos.quantity
             else:
-                floating = (pos.entry_price - price) * pos.quantity
+                floating = (pos.entry_price - live_price) * pos.quantity
             with self.state._lock:
                 pos.peak_unrealized = max(pos.peak_unrealized, floating)
                 trail_note = " · trail ON" if pos.trail_active else ""
@@ -1808,7 +1855,7 @@ class TradingBot:
                     bars_held,
                     config.FORWARD_WINDOW,
                 )
-                self._close_position(price, reason_code="TIMEOUT")
+                self._close_position(live_price, reason_code="TIMEOUT")
                 pos = None
             elif pos is not None:
                 if config.is_darvas_box_profile():
@@ -1816,18 +1863,18 @@ class TradingBot:
                 else:
                     compound_strategy.update_trailing_stop(pos, price)
                 if pos.side == "LONG":
-                    if price >= pos.take_profit_price:
-                        self._close_position(price, reason_code="TP")
+                    if live_price >= pos.take_profit_price:
+                        self._close_position(live_price, reason_code="TP")
                         pos = None
-                    elif price <= pos.stop_loss_price:
-                        self._close_position(price, reason_code="SL")
+                    elif live_price <= pos.stop_loss_price:
+                        self._close_position(live_price, reason_code="SL")
                         pos = None
                 elif pos.side == "SHORT":
-                    if price <= pos.take_profit_price:
-                        self._close_position(price, reason_code="TP")
+                    if live_price <= pos.take_profit_price:
+                        self._close_position(live_price, reason_code="TP")
                         pos = None
-                    elif price >= pos.stop_loss_price:
-                        self._close_position(price, reason_code="SL")
+                    elif live_price >= pos.stop_loss_price:
+                        self._close_position(live_price, reason_code="SL")
                         pos = None
 
         # --- Directional entry / flip logic ------------------------------ #
@@ -1838,32 +1885,36 @@ class TradingBot:
             pass
         elif direction == "LONG":
             if pos is not None and pos.side == "SHORT":
-                self._close_position(price, reason_code="FLIP")
+                self._close_position(live_price, reason_code="FLIP")
                 pos = None
             if pos is None:
                 self._open_position(
                     "LONG",
-                    price,
+                    live_price,
                     signal["prob_long"],
                     atr_pct,
                     candles=candles,
                     bracket_override=entry_brackets,
                     signal_label=signal_label,
                 )
+                if config.is_darvas_box_profile() and box_state and self.state.position is not None:
+                    self._darvas_consumed_signal_ts = box_state.timestamp
         elif direction == "SHORT":
             if pos is not None and pos.side == "LONG":
-                self._close_position(price, reason_code="FLIP")
+                self._close_position(live_price, reason_code="FLIP")
                 pos = None
             if pos is None:
                 self._open_position(
                     "SHORT",
-                    price,
+                    live_price,
                     signal["prob_short"],
                     atr_pct,
                     candles=candles,
                     bracket_override=entry_brackets,
                     signal_label=signal_label,
                 )
+                if config.is_darvas_box_profile() and box_state and self.state.position is not None:
+                    self._darvas_consumed_signal_ts = box_state.timestamp
         else:
             # CASH: explain why no trade was taken (only when flat; if a position
             # is open the bracket messages above already describe the state).
@@ -2074,6 +2125,8 @@ class TradingBot:
             self._session_armed = True
             _write_active_session_marker(self)
             _register_process_shutdown_hook(self)
+            if config.is_darvas_box_profile():
+                self._resolve_darvas_daily_bounds()
             logger.info(
                 "Trading loop started (interval=%ss, session=%s).",
                 config.LOOP_SLEEP_SECONDS,

@@ -36,10 +36,24 @@ def test_previous_utc_day_bounds_extracts_high_low_middle():
     assert len(rows) == 96
 
 
+def test_previous_utc_day_bounds_prefers_exchange_daily_values():
+    candles = _two_day_frame(close=100.0)
+    top, bottom, middle, prev_day, rows = BoxStrategyEngine.previous_utc_day_bounds(
+        candles,
+        daily_high=120.0,
+        daily_low=80.0,
+    )
+    assert top == 120.0
+    assert bottom == 80.0
+    assert middle == 100.0
+    assert prev_day.isoformat() == "2026-06-01"
+    assert len(rows) == 96
+
+
 def test_box_state_inside_range_returns_cash():
     engine = BoxStrategyEngine(volume_filter_multiplier=1.1)
     candles = _two_day_frame(close=100.0)
-    state = engine.evaluate(candles)
+    state = engine.evaluate(candles, daily_high=110.0, daily_low=90.0)
     assert state.valid is True
     assert state.top == 110.0
     assert state.bottom == 90.0
@@ -49,22 +63,40 @@ def test_box_state_inside_range_returns_cash():
     assert state.breakout == "CASH"
 
 
+def test_at_middle_line_stays_cash():
+    engine = BoxStrategyEngine(volume_filter_multiplier=1.0)
+    candles = _two_day_frame(close=100.0)
+    state = engine.evaluate(candles, daily_high=110.0, daily_low=90.0)
+    assert state.breakout == "CASH"
+
+
+def test_forming_candle_dip_does_not_trigger_short():
+    engine = BoxStrategyEngine(volume_filter_multiplier=1.0)
+    candles = _two_day_frame(close=100.0)
+    forming_ts = pd.Timestamp.now(tz="UTC").floor("15min")
+    candles.loc[candles.index[-1], "Timestamp"] = forming_ts
+    candles.loc[candles.index[-1], "Close"] = 85.0
+    state = engine.evaluate(candles, daily_high=110.0, daily_low=90.0)
+    assert state.breakout == "CASH"
+    assert state.close == 100.0
+
+
 def test_active_box_number_increments_on_new_utc_day():
     engine = BoxStrategyEngine(volume_filter_multiplier=1.0)
     day1 = _two_day_frame(close=100.0)
-    state1 = engine.evaluate(day1)
+    state1 = engine.evaluate(day1, daily_high=110.0, daily_low=90.0)
     assert state1.active_box_number == 1
 
     day2 = _two_day_frame(close=100.0)
     day2["Timestamp"] = pd.to_datetime(day2["Timestamp"], utc=True) + pd.Timedelta(days=1)
-    state2 = engine.evaluate(day2)
+    state2 = engine.evaluate(day2, daily_high=110.0, daily_low=90.0)
     assert state2.active_box_number == 2
 
 
 def test_box_breakout_long_with_volume_gate():
     engine = BoxStrategyEngine(volume_filter_multiplier=1.2)
     candles = _two_day_frame(close=111.0, volume=160.0)
-    state = engine.evaluate(candles)
+    state = engine.evaluate(candles, daily_high=110.0, daily_low=90.0)
     assert state.valid is True
     assert state.volume_ok is True
     assert state.breakout == "LONG"
@@ -73,7 +105,7 @@ def test_box_breakout_long_with_volume_gate():
 def test_box_breakout_short_blocked_by_volume():
     engine = BoxStrategyEngine(volume_filter_multiplier=1.2)
     candles = _two_day_frame(close=89.0, volume=80.0)
-    state = engine.evaluate(candles)
+    state = engine.evaluate(candles, daily_high=110.0, daily_low=90.0)
     assert state.valid is True
     assert state.volume_ok is False
     assert state.breakout == "CASH"

@@ -34,6 +34,11 @@ def test_darvas_profile_opens_long_on_breakout(bot, monkeypatch):
     monkeypatch.setattr(config, "BOX_RISK_REWARD_RATIO", 2.0)
 
     candles = _darvas_breakout_frame(close=111.0)
+    monkeypatch.setattr(
+        bot_loop.data_pipeline,
+        "fetch_previous_utc_day_high_low",
+        lambda *_a, **_k: (110.0, 90.0, "2026-06-01"),
+    )
     monkeypatch.setattr(bot_loop.data_pipeline, "fetch_latest_candles", lambda: candles)
     monkeypatch.setattr(
         bot_loop.model_brain,
