@@ -2082,6 +2082,8 @@ class TradingBot:
             )
         self._log_status(boot_price)
         self._write_runtime_snapshot()
+
+    def _log_iteration_error(self, exc: str) -> None:
         """Persist a visible row when an iteration throws (loop stays alive)."""
         with self.state._lock:
             self.state.last_action = "ERROR"
