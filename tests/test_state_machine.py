@@ -252,7 +252,12 @@ def test_spread_gate_blocks_entry(bot, monkeypatch):
     )
     _drive_iteration(bot, monkeypatch, price=60_000.0, prob_long=0.90, prob_short=0.05)
     assert bot.state.position is None
-    assert "SKIPPED_LONG_SPREAD" in bot.state.last_action or "Spread too wide" in bot.state.last_reason
+    df = bot.store.read_status_df()
+    actions = df["Action"].astype(str).tolist()
+    reasons = df["Reason"].astype(str).tolist()
+    assert any("SKIPPED_LONG_SPREAD" in a for a in actions) or any(
+        "Spread too wide" in r for r in reasons
+    )
 
 
 def test_instance_lock_blocks_second_engine(tmp_path):

@@ -151,15 +151,19 @@ class TradeRecord:
 class TradeStore:
     """Thread-safe SQLite store (WAL mode, one connection per operation)."""
 
+    _SQLITE_TIMEOUT_SEC: float = 30.0
+    _BUSY_TIMEOUT_MS: int = 30_000
+
     def __init__(self, db_path: Optional[str] = None) -> None:
         self.db_path = db_path or config.DB_FILE
         self._init_schema()
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        conn = sqlite3.connect(self.db_path, timeout=self._SQLITE_TIMEOUT_SEC)
         try:
-            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute(f"PRAGMA busy_timeout = {self._BUSY_TIMEOUT_MS}")
             yield conn
             conn.commit()
         finally:
@@ -167,7 +171,6 @@ class TradeStore:
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
-            conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(_SCHEMA)
 
     # ------------------------------------------------------------------ #

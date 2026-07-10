@@ -237,18 +237,26 @@ def _add_flow_features(out: pd.DataFrame) -> pd.DataFrame:
 def _add_mtf_features(out: pd.DataFrame) -> pd.DataFrame:
     for col in MTF_FEATURE_COLUMNS:
         out[col] = np.nan
-    if "Timestamp" not in out.columns:
+    if out.empty or "Timestamp" not in out.columns:
         return out
 
-    ts = pd.to_datetime(out["Timestamp"], utc=True)
+    ts = pd.to_datetime(out["Timestamp"], utc=True, errors="coerce")
+    if ts.isna().all():
+        return out
+
+    safe = out.loc[ts.notna()].copy()
+    if safe.empty:
+        return out
+
+    ts = pd.to_datetime(safe["Timestamp"], utc=True)
     hourly = (
-        out.assign(_ts=ts)
+        safe.assign(_ts=ts)
         .set_index("_ts")
         .resample("1h")
         .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
         .dropna(subset=["Close"])
     )
-    if hourly.empty:
+    if hourly.empty or len(hourly) < 2:
         return out
 
     hourly["rsi_1h"] = _rsi(hourly["Close"])
@@ -256,11 +264,16 @@ def _add_mtf_features(out: pd.DataFrame) -> pd.DataFrame:
     hourly["macd_hist_1h"] = hist_1h
     ema20 = _ema(hourly["Close"], 20)
     ema50 = _ema(hourly["Close"], 50)
-    hourly["ema_spread_1h"] = (ema20 - ema50) / hourly["Close"]
+    denom = hourly["Close"].replace(0.0, np.nan)
+    hourly["ema_spread_1h"] = (ema20 - ema50) / denom
 
-    aligned = hourly[MTF_FEATURE_COLUMNS].reindex(ts, method="ffill")
+    row_ts = pd.to_datetime(out["Timestamp"], utc=True, errors="coerce")
+    aligned = hourly[MTF_FEATURE_COLUMNS].reindex(row_ts, method="ffill")
     for col in MTF_FEATURE_COLUMNS:
-        out[col] = aligned[col].to_numpy()
+        values = aligned[col].to_numpy(dtype=np.float64, copy=True)
+        if len(values) != len(out):
+            continue
+        out[col] = values
     return out
 
 
@@ -313,6 +326,8 @@ def add_technical_indicators(
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"DataFrame missing required columns: {sorted(missing)}")
+    if df.empty:
+        raise ValueError("Cannot compute indicators on an empty OHLCV frame.")
 
     out = df.copy()
     close = out["Close"]
@@ -510,6 +525,14 @@ def compute_live_features(
     as the inference vector. ``feature_variant`` defaults to
     ``config.FEATURE_VARIANT``.
     """
+    if df is None or df.empty:
+        raise ValueError("No candle data available for live feature computation.")
+    min_rows = max(config.STRUCTURE_LOOKBACK, config.RETURN_LONG_LOOKBACK, 50) + 5
+    if len(df) < min_rows:
+        raise ValueError(
+            f"Insufficient candles for live features: need >= {min_rows}, got {len(df)}."
+        )
+
     variant = feature_variant if feature_variant is not None else config.FEATURE_VARIANT
     enriched = add_technical_indicators(df, feature_variant=variant)
     enriched = enriched.replace([np.inf, -np.inf], np.nan)

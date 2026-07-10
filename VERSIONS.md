@@ -3,31 +3,31 @@
 This document tracks **every major release** of the bot: what each version does, how
 to identify it at runtime, and what changed from the previous version.
 
-**Current release:** `v2.1.0` · **Default profile:** `darvas_box` (`ACTIVE_PROFILE=darvas_box`)  
-**Legacy profile still available:** `xgboost_ml` (`ACTIVE_PROFILE=xgboost_ml`)
+**Current release:** `v2.1.0` · **Default profile:** `xgboost_ml` (`ACTIVE_PROFILE=xgboost_ml`, `FEATURE_VARIANT=F2`)  
+**Alternate profile:** `darvas_box` (`ACTIVE_PROFILE=darvas_box`)
 
 ---
 
 ## Quick reference
 
 
-| Version    | Codename / profile  | Timeframe | Default? | One-line summary                               |
-| ---------- | ------------------- | --------- | -------- | ---------------------------------------------- |
-| **v0.9.0** | Baseline            | 1h        | —        | CSV log, basic 1h swing bot                    |
-| **v1.0.0** | Foundation          | 1h        | —        | SQLite store, aligned labels, session reporter |
-| **v1.1.0** | Rigor               | 1h        | —        | Walk-forward backtest with costs               |
-| **v1.2.0** | Guardrails          | 1h        | —        | Risk engine wired into live loop               |
-| **v1.3.0** | Hardening           | 1h        | —        | Retry, alerts, TESTNET/LIVE gate               |
-| **v1.4.0** | Honesty             | 1h        | —        | 84+ tests, dashboard truth fixes               |
-| **v1.5.0** | Rollout plan        | 1h        | —        | Staged mainnet proposal (docs only)            |
-| **v1.6.0** | Desk UI             | 1h        | —        | Retro trade log, heartbeat strip               |
-| **v1.6.1** | Stability           | 1h        | —        | Deadlock fix, boot heartbeat                   |
-| **v2.0.0** | **COMPOUND**        | **15m**   | **✅**    | Active compounding strategy (Path B)           |
-| **v2.0.1** | COMPOUND + export   | 15m       | —        | Session CSV dossier on shutdown                |
-| **v2.0.2** | COMPOUND + audit    | 15m       | —        | Honest threshold optimizer + label sweep tool  |
-| **v2.0.3** | COMPOUND + features | 15m       | —        | Phase 3 feature groups + aligned scalp brackets |
+| Version    | Codename / profile  | Timeframe | Default? | One-line summary                                        |
+| ---------- | ------------------- | --------- | -------- | ------------------------------------------------------- |
+| **v0.9.0** | Baseline            | 1h        | —        | CSV log, basic 1h swing bot                             |
+| **v1.0.0** | Foundation          | 1h        | —        | SQLite store, aligned labels, session reporter          |
+| **v1.1.0** | Rigor               | 1h        | —        | Walk-forward backtest with costs                        |
+| **v1.2.0** | Guardrails          | 1h        | —        | Risk engine wired into live loop                        |
+| **v1.3.0** | Hardening           | 1h        | —        | Retry, alerts, TESTNET/LIVE gate                        |
+| **v1.4.0** | Honesty             | 1h        | —        | 84+ tests, dashboard truth fixes                        |
+| **v1.5.0** | Rollout plan        | 1h        | —        | Staged mainnet proposal (docs only)                     |
+| **v1.6.0** | Desk UI             | 1h        | —        | Retro trade log, heartbeat strip                        |
+| **v1.6.1** | Stability           | 1h        | —        | Deadlock fix, boot heartbeat                            |
+| **v2.0.0** | **COMPOUND**        | **15m**   | **✅**    | Active compounding strategy (Path B)                    |
+| **v2.0.1** | COMPOUND + export   | 15m       | —        | Session CSV dossier on shutdown                         |
+| **v2.0.2** | COMPOUND + audit    | 15m       | —        | Honest threshold optimizer + label sweep tool           |
+| **v2.0.3** | COMPOUND + features | 15m       | —        | Phase 3 feature groups + aligned scalp brackets         |
 | **v2.0.4** | COMPOUND + F2 tune  | 15m       | **✅**    | Asymmetric thresholds, F2 audit, capital-preserving OOS |
-| **v2.1.0** | **Darvas Box**      | **15m**   | **✅**    | Modular multi-profile runtime + breakout box engine |
+| **v2.1.0** | **XGBoost ML**      | **15m**   | **✅**    | ML default profile + live scan heartbeats in dashboard  |
 
 
 ---
@@ -35,18 +35,18 @@ to identify it at runtime, and what changed from the previous version.
 ## How to see which version you are running
 
 
-| Signal              | Where to look                                            |
-| ------------------- | -------------------------------------------------------- |
-| **Profile**         | Dashboard banner: `… BTCUSDT 15m 3x                      |
-| **Timeframe**       | Same banner (`15m` = Compound, `1h` = Swing)             |
-| **Thresholds**      | `decision_threshold.json` or dashboard expander          |
-| **Exports**         | `session_exports/` folder exists → v2.0.1+               |
-| **Label sweep**     | `label_sweep.py` / `label_sweep_report.md` → v2.0.2+     |
-| **Feature sweep**   | `feature_sweep.py` / `feature_sweep_report.md` → v2.0.3+ |
-| **Feature variant** | `.env` `FEATURE_VARIANT=F2` (recommended) → v2.0.4+      |
-| **Prediction audit** | `audit_predictions.py` → v2.0.4+                        |
-| **Retrain CLI**     | `python model_brain.py --retrain` → v2.0.4+            |
-| **Compound strip**  | 7d PnL / expectancy row on dashboard → v2.0.0+           |
+| Signal               | Where to look                                            |
+| -------------------- | -------------------------------------------------------- |
+| **Profile**          | Dashboard banner: `… BTCUSDT 15m 3x                      |
+| **Timeframe**        | Same banner (`15m` = Compound, `1h` = Swing)             |
+| **Thresholds**       | `decision_threshold.json` or dashboard expander          |
+| **Exports**          | `session_exports/` folder exists → v2.0.1+               |
+| **Label sweep**      | `label_sweep.py` / `label_sweep_report.md` → v2.0.2+     |
+| **Feature sweep**    | `feature_sweep.py` / `feature_sweep_report.md` → v2.0.3+ |
+| **Feature variant**  | `.env` `FEATURE_VARIANT=F2` (recommended) → v2.0.4+      |
+| **Prediction audit** | `audit_predictions.py` → v2.0.4+                         |
+| **Retrain CLI**      | `python model_brain.py --retrain` → v2.0.4+              |
+| **Compound strip**   | 7d PnL / expectancy row on dashboard → v2.0.0+           |
 
 
 Switch profile in `.env`:
@@ -243,7 +243,7 @@ TRADING_PROFILE=SWING      # v1.x legacy — retrain on 1h data after switching
 | **Brackets**          | ATR-scaled optional                                            | Fixed % only                  |
 | **Trailing stop**     | **On** (+0.4% act, 0.2% trail)                                 | Off                           |
 | **Allocation**        | **12%** margin                                                 | 25% margin                    |
-| **Thresholds**        | Data-driven per side (e.g. **0.49 / 0.60** F2)               | High (e.g. 0.45/0.775)        |
+| **Thresholds**        | Data-driven per side (e.g. **0.49 / 0.60** F2)                 | High (e.g. 0.45/0.775)        |
 | **Trade frequency**   | High (many scans/day)                                          | Low (often hours idle)        |
 | **Re-entry cooldown** | **60s** after TP/SL                                            | None                          |
 | **Loss halt**         | **−5%** session budget                                         | −3%                           |
@@ -410,24 +410,26 @@ tight thresholds — but walk-forward and live behavior exposed three problems:
 **Threshold optimizer (COMPOUND defaults)**
 
 
-| Setting | Value | Purpose |
-| ------- | ----- | ------- |
-| `MIN_VALIDATION_TRADES` | **5** | Enough signal for sparse 15m folds without forcing fallback |
-| `THRESHOLD_SEARCH_MIN/MAX/STEP` | **0.34 – 0.85 / 0.01** | Fine organic search up to high conviction |
-| `LONG_FALLBACK_THRESHOLD` | **0.78** | Conservative long entries when no organic pass |
-| `SHORT_FALLBACK_THRESHOLD` | **0.60** | More aggressive short capture in flushes (not 0.78) |
-| Positive-PnL gate | **still on** | Organic thresholds must beat 0% net on validation slice |
+| Setting                         | Value                  | Purpose                                                     |
+| ------------------------------- | ---------------------- | ----------------------------------------------------------- |
+| `MIN_VALIDATION_TRADES`         | **5**                  | Enough signal for sparse 15m folds without forcing fallback |
+| `THRESHOLD_SEARCH_MIN/MAX/STEP` | **0.34 – 0.85 / 0.01** | Fine organic search up to high conviction                   |
+| `LONG_FALLBACK_THRESHOLD`       | **0.78**               | Conservative long entries when no organic pass              |
+| `SHORT_FALLBACK_THRESHOLD`      | **0.60**               | More aggressive short capture in flushes (not 0.78)         |
+| Positive-PnL gate               | **still on**           | Organic thresholds must beat 0% net on validation slice     |
+
 
 **Current trained artifact (F2, 2026-07-06)**
 
 
-| Metric | Value |
-| ------ | ----- |
-| `FEATURE_VARIANT` | **F2** (22 features) |
-| `decision_threshold.json` | **long 0.49** (organic) · **short 0.60** (fallback) |
-| OOS strategy PnL (20% holdout) | **−1.81%** |
-| Buy & hold (same period) | **−11.30%** |
-| OOS trades | 17 long / 0 short (holdout slice; live shorts enabled at 0.60) |
+| Metric                         | Value                                                          |
+| ------------------------------ | -------------------------------------------------------------- |
+| `FEATURE_VARIANT`              | **F2** (22 features)                                           |
+| `decision_threshold.json`      | **long 0.49** (organic) · **short 0.60** (fallback)            |
+| OOS strategy PnL (20% holdout) | **−1.81%**                                                     |
+| Buy & hold (same period)       | **−11.30%**                                                    |
+| OOS trades                     | 17 long / 0 short (holdout slice; live shorts enabled at 0.60) |
+
 
 **New / updated tooling**
 
@@ -471,7 +473,36 @@ python backtest_runner.py
 
 ---
 
-### v2.1.0 — Darvas Box multi-profile runtime (current)
+### v2.1.0 — XGBoost ML production default + live scan heartbeats (current)
+
+**Date:** 2026-07-10
+
+**Highlights**
+
+- **Production default profile** switched to `xgboost_ml` + `TRADING_PROFILE=COMPOUND` + `FEATURE_VARIANT=F2` (`tuned_thr_no_ema50` live path).
+- **EMA50 trend gate bypassed** on the live `xgboost_ml` inference path — model trades both directions from localized F2 features and asymmetric thresholds only.
+- **Micro-scalp brackets** aligned: `TAKE_PROFIT_PCT=0.004`, `STOP_LOSS_PCT=0.0025`, `FORWARD_WINDOW=16` on 15m bars.
+- **Asymmetric fallbacks** preserved: `LONG_FALLBACK_THRESHOLD=0.78`, `SHORT_FALLBACK_THRESHOLD=0.60`.
+- **Live scan heartbeats**: every 5s iteration writes a `SCAN` row to SQLite (`Scan Complete: Model checked, staying FLAT | LONG x%/thr | SHORT x%/thr`); Session Activity shows these rows (no more silent HOLD/WAIT filtering).
+- **Dashboard**: ML probability threshold meters restored when `ACTIVE_PROFILE=xgboost_ml`; Darvas box widgets hidden unless `darvas_box` is active.
+- **Uptime hardening**: `_api_state_lock` decouples connection flags from `state._lock`; SQLite WAL + 30s busy timeout; F2 feature pipeline index/NaN guards; runtime snapshot writes outside the engine mutex.
+- **systemd** (`deploy/systemd/crypto-bot.service`): explicit `Environment=` overrides for ML profile on the Oracle VM.
+- Darvas Box profile remains available via `ACTIVE_PROFILE=darvas_box` (modular `profiles/` catalog + `box_strategy.py` unchanged).
+
+**Previous v2.1.0 scope (2026-07-08)** — multi-profile runtime architecture and Darvas Box engine — see git history / `box_strategy.py`.
+
+**Verify at runtime**
+
+```bash
+python -c "import config; print(config.ACTIVE_PROFILE, config.FEATURE_VARIANT, config.USE_EMA50_TREND_GATE)"
+# xgboost_ml F2 False
+```
+
+Dashboard Session Activity should show a new `SCAN` row every ~5 seconds while the engine is running.
+
+---
+
+### v2.1.0 (archived notes) — Darvas Box multi-profile runtime
 
 **Date:** 2026-07-08
 
@@ -562,8 +593,8 @@ streamlit run dashboard.py
 | v1.6.1 → v2.0.0 | **Strategy:** Path B COMPOUND (15m, trailing, streak sizing, lower thresholds) |
 | v2.0.0 → v2.0.1 | **Feature:** session CSV export on shutdown                                    |
 | v2.0.1 → v2.0.2 | **Audit:** honest threshold optimizer, label sweep tool, sizing floor fix      |
-| v2.0.2 → v2.0.3 | **Features:** Phase 3 groups (F0–F5) + aligned scalp TP/SL (0.4%/0.25%)     |
-| v2.0.3 → v2.0.4 | **Tune:** asymmetric thresholds (L0.78/S0.60), F2 audit, `--retrain` CLI   |
+| v2.0.2 → v2.0.3 | **Features:** Phase 3 groups (F0–F5) + aligned scalp TP/SL (0.4%/0.25%)        |
+| v2.0.3 → v2.0.4 | **Tune:** asymmetric thresholds (L0.78/S0.60), F2 audit, `--retrain` CLI       |
 | v2.0.4 → v2.1.0 | **Strategy:** profile switch architecture + Darvas Box breakout engine         |
 
 
@@ -581,10 +612,10 @@ streamlit run dashboard.py
 | `LIVE_READINESS_CHECKLIST.md` | Phase 3 hardening evidence                                             |
 | `backtest_report.md`          | Latest walk-forward numbers (regenerate with `backtest_runner.py`)     |
 | `label_sweep_report.md`       | Label horizon / TP-SL comparison (`python label_sweep.py`)             |
-| `feature_sweep_report.md`     | Phase 3 feature comparison (`python feature_sweep.py`)               |
-| `audit_predictions.py`        | F2 holdout prediction audit vs scalp ground truth                    |
+| `feature_sweep_report.md`     | Phase 3 feature comparison (`python feature_sweep.py`)                 |
+| `audit_predictions.py`        | F2 holdout prediction audit vs scalp ground truth                      |
 
 
 ---
 
-*Last updated: 2026-07-08 · Current code release: **v2.1.0** · Default profile: **darvas_box** · Legacy fallback: `ACTIVE_PROFILE=xgboost_ml`*
+*Last updated: 2026-07-10 · Current code release: **v2.1.0** · Default profile: **xgboost_ml** (`FEATURE_VARIANT=F2`, scan heartbeats ON) · Alternate: `ACTIVE_PROFILE=darvas_box`*

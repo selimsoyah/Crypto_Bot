@@ -117,13 +117,13 @@ THRESHOLD_PATH: Final[str] = str(BASE_DIR / "decision_threshold.json")
 # --------------------------------------------------------------------------- #
 TRADING_PROFILE: Final[str] = _env("TRADING_PROFILE", "COMPOUND").upper()
 # Phase 3 feature variant (F0=baseline … F5=all extras). See feature_sweep.py.
-FEATURE_VARIANT: Final[str] = _env("FEATURE_VARIANT", "F0").upper()
+FEATURE_VARIANT: Final[str] = _env("FEATURE_VARIANT", "F2").upper()
 
-# Strategy runtime profile: xgboost_ml (legacy) or darvas_box (new breakout mode).
-_ACTIVE_PROFILE_RAW = _env("ACTIVE_PROFILE", PROFILE_DARVAS_BOX)
+# Strategy runtime profile: xgboost_ml (ML compounding) or darvas_box (breakout).
+_ACTIVE_PROFILE_RAW = _env("ACTIVE_PROFILE", PROFILE_XGBOOST_ML)
 ACTIVE_PROFILE: Final[str] = normalize_profile_name(_ACTIVE_PROFILE_RAW)
 if ACTIVE_PROFILE not in SUPPORTED_PROFILES:
-    ACTIVE_PROFILE = PROFILE_DARVAS_BOX
+    ACTIVE_PROFILE = PROFILE_XGBOOST_ML
 
 PROFILE_SETTINGS: Final[dict] = build_profile_catalog()
 ACTIVE_PROFILE_SETTINGS: Final[dict] = PROFILE_SETTINGS[ACTIVE_PROFILE]
@@ -144,6 +144,13 @@ def is_xgboost_ml_profile() -> bool:
 
 def is_darvas_box_profile() -> bool:
     return ACTIVE_PROFILE == PROFILE_DARVAS_BOX
+
+
+def use_forward_window_exit() -> bool:
+    """Force-close open positions after ``FORWARD_WINDOW`` bars without TP/SL."""
+    if EXECUTION_AUDIT_PARITY:
+        return True
+    return is_compound_profile() and is_xgboost_ml_profile()
 
 
 # --------------------------------------------------------------------------- #
@@ -199,10 +206,10 @@ elif is_compound_profile():
     # Structure features: 96 × 15m = 24 hours lookback.
     STRUCTURE_LOOKBACK: Final[int] = int(_env("STRUCTURE_LOOKBACK", "96"))
     RETURN_LONG_LOOKBACK: Final[int] = int(_env("RETURN_LONG_LOOKBACK", "96"))
-    # Scalp brackets — single source of truth for labels, backtest, and live execution.
-    # LONG: +0.80% TP / −0.50% SL (1.6:1 R:R) · symmetric triple-barrier for shorts.
-    TAKE_PROFIT_PCT: Final[float] = float(_env("TAKE_PROFIT_PCT", "0.008"))
-    STOP_LOSS_PCT: Final[float] = float(_env("STOP_LOSS_PCT", "0.005"))
+    # Micro-scalp brackets — single source of truth for labels, backtest, and live.
+    # LONG: +0.40% TP / −0.25% SL · symmetric triple-barrier for shorts.
+    TAKE_PROFIT_PCT: Final[float] = float(_env("TAKE_PROFIT_PCT", "0.004"))
+    STOP_LOSS_PCT: Final[float] = float(_env("STOP_LOSS_PCT", "0.0025"))
     HISTORICAL_PARQUET: Final[str] = str(
         BASE_DIR / _env("HISTORICAL_PARQUET", "historical_btc_15m.parquet")
     )
@@ -242,7 +249,12 @@ USE_TREND_FILTER: Final[bool] = _env("USE_TREND_FILTER", "false").lower() in (
     "yes",
 )
 # Primary momentum gate on 15m bars: block longs below EMA50, shorts above EMA50.
-_EMA50_GATE_DEFAULT = "true" if is_compound_profile() else "false"
+# Disabled by default on xgboost_ml (tuned_thr_no_ema50 live profile).
+_EMA50_GATE_DEFAULT = (
+    "false"
+    if is_xgboost_ml_profile()
+    else ("true" if is_compound_profile() else "false")
+)
 USE_EMA50_TREND_GATE: Final[bool] = _env("USE_EMA50_TREND_GATE", _EMA50_GATE_DEFAULT).lower() in (
     "1",
     "true",
@@ -308,7 +320,12 @@ else:
     LIVE_CANDLE_LOOKBACK: Final[int] = 350
 
 # Path B — compounding behaviour (active when TRADING_PROFILE=COMPOUND).
-USE_ATR_BRACKETS: Final[bool] = _env("USE_ATR_BRACKETS", "true").lower() in (
+_ATR_BRACKETS_DEFAULT = (
+    "false"
+    if is_compound_profile() and is_xgboost_ml_profile()
+    else "true"
+)
+USE_ATR_BRACKETS: Final[bool] = _env("USE_ATR_BRACKETS", _ATR_BRACKETS_DEFAULT).lower() in (
     "1", "true", "yes",
 )
 ATR_BRACKET_TP_MULT: Final[float] = float(_env("ATR_BRACKET_TP_MULT", "1.2"))
@@ -399,9 +416,13 @@ EXCHANGE_RECONNECT_THRESHOLD: Final[int] = int(_env("EXCHANGE_RECONNECT_THRESHOL
 # --------------------------------------------------------------------------- #
 # Live execution — audit-parity maker fills (COMPOUND / F2 audit alignment)   #
 # --------------------------------------------------------------------------- #
-# When true: fixed audit brackets (+0.8% / −0.5%), no ATR scaling, no
-# trailing stop, and FORWARD_WINDOW bar timeout exits (matches audit_predictions).
-_EXEC_AUDIT_DEFAULT = "true" if is_compound_profile() else "false"
+# When true: fixed config brackets, no ATR scaling, no trailing stop, and
+# FORWARD_WINDOW bar timeout exits (matches audit_predictions).
+_EXEC_AUDIT_DEFAULT = (
+    "false"
+    if is_xgboost_ml_profile()
+    else ("true" if is_compound_profile() else "false")
+)
 EXECUTION_AUDIT_PARITY: Final[bool] = _env(
     "EXECUTION_AUDIT_PARITY", _EXEC_AUDIT_DEFAULT
 ).lower() in ("1", "true", "yes")

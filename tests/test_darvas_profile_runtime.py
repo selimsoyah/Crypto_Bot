@@ -52,7 +52,13 @@ def test_darvas_profile_opens_long_on_breakout(bot, monkeypatch):
     )
 
     import feature_factory
+    from box_strategy import BoxStrategyEngine
 
+    monkeypatch.setattr(
+        BoxStrategyEngine,
+        "_daily_adx14",
+        staticmethod(lambda frame, ts: 25.0),
+    )
     monkeypatch.setattr(
         feature_factory,
         "compute_live_features",
@@ -68,6 +74,6 @@ def test_darvas_profile_opens_long_on_breakout(bot, monkeypatch):
     assert bot._active_box.bottom == 90.0
     assert bot._active_box.middle_line == 100.0
     assert bot._active_box.breakout == "LONG"
-    # Box-height RR brackets are derived from previous-day boundaries, not the mocked ticker.
-    assert bot.state.position.take_profit_price > bot._active_box.top
-    assert bot.state.position.stop_loss_price < bot._active_box.bottom
+    # ATR-based risk brackets (Phase 2+) — SL sits below entry, TP above.
+    assert bot.state.position.stop_loss_price < bot.state.position.entry_price
+    assert bot.state.position.take_profit_price > bot.state.position.entry_price

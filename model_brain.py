@@ -769,16 +769,38 @@ def predict_latest(model, candles: pd.DataFrame) -> dict[str, float]:
     ``candles`` is a raw OHLCV frame (e.g. from
     ``data_pipeline.fetch_latest_candles``). The returned dict contains
     ``prob_long``, ``prob_short``, ``prob_cash``, ``trend`` (EMA200 distance),
-    and ``price_vs_ema50`` for the live momentum gate.
+    and ``price_vs_ema50`` (informational; live xgboost_ml bypasses EMA50 gate).
     """
+    if candles is None or candles.empty:
+        raise ValueError("No candles supplied for model inference.")
+
     enriched = compute_live_features(candles, feature_variant=config.FEATURE_VARIANT)
     cols = feature_columns_for(config.FEATURE_VARIANT)
+    missing_cols = [c for c in cols if c not in enriched.columns]
+    if missing_cols:
+        raise ValueError(f"Feature columns missing after enrichment: {missing_cols}")
+
     feature_rows = enriched[cols].dropna()
     if feature_rows.empty:
-        raise ValueError("Not enough candles to compute a complete feature row.")
+        raise ValueError(
+            "Not enough valid feature rows for inference — warm-up period incomplete "
+            f"({config.FEATURE_VARIANT}, {len(candles)} candles)."
+        )
+
     latest = feature_rows.iloc[[-1]]
+    if latest.isna().any(axis=None):
+        raise ValueError("Latest feature row contains NaN — cannot run inference.")
+
     proba = model.predict_proba(latest)[0]
+    if proba.shape[0] < config.NUM_CLASSES:
+        raise ValueError(
+            f"Model returned {proba.shape[0]} classes; expected {config.NUM_CLASSES}."
+        )
+
     trend = float(latest["price_vs_ema200"].iloc[0]) if "price_vs_ema200" in latest else 0.0
+    if not np.isfinite(trend):
+        trend = 0.0
+
     if "price_vs_ema50" in enriched.columns:
         price_vs_ema50 = float(enriched["price_vs_ema50"].iloc[-1])
     elif "ema_50" in enriched.columns:
@@ -787,6 +809,9 @@ def predict_latest(model, candles: pd.DataFrame) -> dict[str, float]:
         price_vs_ema50 = (close - ema50) / ema50 if ema50 else 0.0
     else:
         price_vs_ema50 = 0.0
+    if not np.isfinite(price_vs_ema50):
+        price_vs_ema50 = 0.0
+
     return {
         "prob_long": float(proba[config.LABEL_LONG]),
         "prob_short": float(proba[config.LABEL_SHORT]),

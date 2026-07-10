@@ -61,7 +61,7 @@ def test_empty_candles_sets_degraded(bot, monkeypatch):
     assert bot.state.connection_degraded is True
     df = bot.store.read_status_df()
     assert len(df) >= 1
-    assert df.iloc[-1]["Event"] == "WARNING"
+    assert df.iloc[-1]["Event"] == "SCAN"
 
 
 def test_iteration_writes_status_without_deadlock(bot, monkeypatch):
@@ -75,7 +75,7 @@ def test_iteration_writes_status_without_deadlock(bot, monkeypatch):
     drive_iteration(bot, monkeypatch, 60_000.0, 0.05, 0.05)
     df = bot.store.read_status_df()
     assert len(df) >= 1
-    assert df.iloc[-1]["Action"] == "HOLD"
+    assert df.iloc[-1]["Action"] == "SCAN"
 
 
 def test_insufficient_balance_blocks_order(bot, monkeypatch):

@@ -421,20 +421,31 @@ _ACTIVITY_ACTION_PREFIXES = (
     "RISK_",
 )
 _ACTIVITY_EVENTS = frozenset(
-    {"WARNING", "BUY_LONG", "SHORT_ORDER", "STOP_LOSS", "FILL_SUCCESS", "BOOT"}
+    {
+        "WARNING",
+        "BUY_LONG",
+        "SHORT_ORDER",
+        "STOP_LOSS",
+        "FILL_SUCCESS",
+        "BOOT",
+        "SCAN",
+    }
 )
+_SCAN_ACTIONS = frozenset({"SCAN"})
 
 
 def _is_activity_row(action: str, event: str) -> bool:
     action = action or ""
     event = event or ""
+    if action in _SCAN_ACTIONS or event in _SCAN_ACTIONS:
+        return True
     if any(action.startswith(prefix) for prefix in _ACTIVITY_ACTION_PREFIXES):
         return True
     return event in _ACTIVITY_EVENTS
 
 
-def status_to_activity_rows(log: pd.DataFrame, max_rows: int = 40) -> list[dict]:
-    """Convert status-log transitions into operator-facing activity rows."""
+def status_to_activity_rows(log: pd.DataFrame, max_rows: int = 60) -> list[dict]:
+    """Convert status-log rows into operator-facing activity (includes scan heartbeats)."""
     if log.empty:
         return []
 
@@ -452,7 +463,9 @@ def status_to_activity_rows(log: pd.DataFrame, max_rows: int = 40) -> list[dict]
             reason = reason[:117] + "..."
 
         tone = "info"
-        if action.startswith(("SKIPPED_", "BLOCKED_", "EXIT_PENDING_")) or event == "WARNING":
+        if action == "SCAN" or event == "SCAN":
+            tone = "scan"
+        elif action.startswith(("SKIPPED_", "BLOCKED_", "EXIT_PENDING_")) or event == "WARNING":
             tone = "warn"
         elif action.startswith("OPEN_") or event in ("BUY_LONG", "SHORT_ORDER"):
             tone = "open"

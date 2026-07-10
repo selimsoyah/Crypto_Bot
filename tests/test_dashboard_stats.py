@@ -157,7 +157,7 @@ def test_essential_metrics_includes_wallet_from_log():
     assert m["wallet_balance"] == pytest.approx(4321.5)
 
 
-def test_status_to_activity_rows_filters_heartbeats():
+def test_status_to_activity_rows_includes_scan_heartbeats():
     log = pd.DataFrame(
         [
             {
@@ -165,7 +165,14 @@ def test_status_to_activity_rows_filters_heartbeats():
                 "Action": "HOLD",
                 "Event": "WAIT",
                 "Open_Position": "FLAT",
-                "Reason": "scanning",
+                "Reason": "legacy heartbeat (hidden)",
+            },
+            {
+                "Timestamp": "2026-07-06 12:00:05",
+                "Action": "SCAN",
+                "Event": "SCAN",
+                "Open_Position": "FLAT",
+                "Reason": "Scan Complete: Model checked, staying FLAT",
             },
             {
                 "Timestamp": "2026-07-06 12:01:00",
@@ -177,9 +184,11 @@ def test_status_to_activity_rows_filters_heartbeats():
         ]
     )
     rows = dashboard_stats.status_to_activity_rows(log)
-    assert len(rows) == 1
-    assert rows[0]["action"] == "SKIPPED_LONG_POST_ONLY"
-    assert rows[0]["tone"] == "warn"
+    assert len(rows) == 2
+    assert rows[0]["action"] == "SCAN"
+    assert rows[0]["tone"] == "scan"
+    assert rows[1]["action"] == "SKIPPED_LONG_POST_ONLY"
+    assert rows[1]["tone"] == "warn"
 
 
 def test_open_position_row_from_exchange():

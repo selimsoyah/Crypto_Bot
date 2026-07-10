@@ -215,6 +215,9 @@ st.markdown(
     color: #22c55e;
     animation: liveBlink 1.1s ease-in-out infinite;
 }
+.row-scan td {
+    color: #7dd3fc;
+}
 @keyframes liveBlink {
     0%, 100% { background: rgba(34, 197, 94, 0.06); }
     50% { background: rgba(34, 197, 94, 0.25); }
@@ -852,9 +855,13 @@ def render_compound_and_position(
 
 def render_activity(log_df: pd.DataFrame) -> None:
     st.subheader("Session Activity")
-    rows = dashboard_stats.status_to_activity_rows(log_df, max_rows=30)
+    st.caption(
+        f"Live scan feed · auto-refresh every {REFRESH_MS // 1000}s · "
+        "SCAN rows prove the engine is breathing"
+    )
+    rows = dashboard_stats.status_to_activity_rows(log_df, max_rows=50)
     if not rows:
-        st.info("No activity rows yet.")
+        st.info("No activity rows yet — boot the engine to start scan heartbeats.")
         return
     body = []
     for r in rows:
@@ -863,6 +870,8 @@ def render_activity(log_df: pd.DataFrame) -> None:
         tone = str(r.get("tone", "info"))
         if "ERROR" in action or "FAILED" in action:
             cls = "row-bad"
+        elif tone == "scan":
+            cls = "row-scan"
         elif tone == "warn":
             cls = "row-warn"
         else:

@@ -828,6 +828,7 @@ class TradingBot:
         self._transition_logged = False
         self.risk = RiskEngine()
         self._api_failures: int = 0
+        self._api_state_lock = threading.Lock()
         self._last_known_balance: float = 0.0
         self._last_known_total_wallet: float = 0.0
         self._last_close_at: Optional[datetime] = None
@@ -877,26 +878,40 @@ class TradingBot:
             return None, None
 
     def _mark_api_success(self) -> None:
-        self._api_failures = 0
-        with self.state._lock:
+        with self._api_state_lock:
+            self._api_failures = 0
             self.state.connection_degraded = False
             self.state.connection_error = ""
 
     def _mark_api_failure(self, exc: Exception, context: str) -> None:
-        self._api_failures += 1
-        safe = config.sanitize_for_log(str(exc))
-        with self.state._lock:
+        self._api_state_lock.acquire()
+        try:
+            self._api_failures += 1
+            failures = self._api_failures
+            safe = config.sanitize_for_log(str(exc))
             self.state.connection_degraded = True
             self.state.connection_error = f"{context}: {safe}"
-        if self._api_failures == config.EXCHANGE_DEGRADED_THRESHOLD:
+        finally:
+            self._api_state_lock.release()
+        if failures == config.EXCHANGE_DEGRADED_THRESHOLD:
             send_alert(
                 "WARNING",
                 "API connection degraded",
                 self.state.connection_error,
                 key="api_degraded",
             )
-        if self._api_failures >= config.EXCHANGE_RECONNECT_THRESHOLD:
+        if failures >= config.EXCHANGE_RECONNECT_THRESHOLD:
             self._reconnect_client()
+
+    def _mark_stale_data(self, reason: str) -> None:
+        """Mark heartbeat STALE/DEGRADED without counting as an exchange API failure."""
+        safe = config.sanitize_for_log(reason)
+        with self._api_state_lock:
+            self.state.connection_degraded = True
+            self.state.connection_error = safe
+            self.state.last_action = "HOLD"
+            self.state.last_event = "WARNING"
+            self.state.last_reason = safe
 
     def _reconnect_client(self) -> None:
         """Attempt to rebuild the execution client after repeated failures."""
@@ -913,7 +928,7 @@ class TradingBot:
         except Exception as exc:
             msg = config.sanitize_for_log(str(exc))
             logger.error("Reconnect failed: %s", msg)
-            with self.state._lock:
+            with self._api_state_lock:
                 self.state.connection_error = f"Reconnect failed: {msg}"
 
     # ------------------------------------------------------------------ #
@@ -936,8 +951,11 @@ class TradingBot:
     def _configure_symbol(self) -> None:
         """Set leverage / margin type and cache the symbol lot-size filters."""
         try:
-            self._client.futures_change_leverage(
-                symbol=config.SYMBOL, leverage=config.LEVERAGE
+            exchange_client.call_with_retry(
+                self._client.futures_change_leverage,
+                symbol=config.SYMBOL,
+                leverage=config.LEVERAGE,
+                label="futures_change_leverage",
             )
             logger.info("Set leverage to %dx on %s.", config.LEVERAGE, config.SYMBOL)
         except Exception as exc:  # pragma: no cover - network dependent
@@ -945,8 +963,11 @@ class TradingBot:
 
         # Margin type (ISOLATED / CROSSED). Binance errors if already set; ignore.
         try:
-            self._client.futures_change_margin_type(
-                symbol=config.SYMBOL, marginType=config.MARGIN_TYPE
+            exchange_client.call_with_retry(
+                self._client.futures_change_margin_type,
+                symbol=config.SYMBOL,
+                marginType=config.MARGIN_TYPE,
+                label="futures_change_margin_type",
             )
             logger.info("Set margin type to %s on %s.", config.MARGIN_TYPE, config.SYMBOL)
         except Exception as exc:  # pragma: no cover - often "no need to change"
@@ -1218,25 +1239,30 @@ class TradingBot:
         return order_execution.fetch_book_ticker(self._client, config.SYMBOL)
 
     def _log_directional_signal(self, signal: dict, direction: str) -> None:
-        """Log every scan; highlight threshold-clearing predictions."""
-        p_long = signal["prob_long"] * 100.0
-        p_short = signal["prob_short"] * 100.0
-        long_thr = self._long_threshold * 100.0
-        short_thr = self._short_threshold * 100.0
-        long_ready = signal["prob_long"] > self._long_threshold
-        short_ready = signal["prob_short"] > self._short_threshold
-        level = logger.info if (long_ready or short_ready) else logger.debug
-        level(
-            "SIGNAL SCAN | LONG %.2f%% (thr %.2f%% %s) | SHORT %.2f%% (thr %.2f%% %s) "
-            "| decision=%s | CASH %.2f%%",
+        """Log model probability vs threshold on every inference scan."""
+        p_long = signal["prob_long"]
+        p_short = signal["prob_short"]
+        long_thr = self._long_threshold
+        short_thr = self._short_threshold
+        long_ready = p_long > long_thr
+        short_ready = p_short > short_thr
+        ema_note = "EMA50 gate OFF" if config.is_xgboost_ml_profile() else (
+            "EMA50 gate ON" if config.USE_EMA50_TREND_GATE else "EMA50 gate OFF"
+        )
+        logger.info(
+            "SIGNAL EVAL | LONG %.4f vs thr %.4f (%s, gap %+.4f) | "
+            "SHORT %.4f vs thr %.4f (%s, gap %+.4f) | CASH %.4f | decision=%s | %s",
             p_long,
             long_thr,
-            "READY" if long_ready else "below",
+            "PASS" if long_ready else "below",
+            p_long - long_thr,
             p_short,
             short_thr,
-            "READY" if short_ready else "below",
+            "PASS" if short_ready else "below",
+            p_short - short_thr,
+            signal["prob_cash"],
             direction,
-            signal["prob_cash"] * 100.0,
+            ema_note,
         )
 
     def _reject_entry(
@@ -1570,6 +1596,60 @@ class TradingBot:
             self.state.last_action = action
             self.state.last_reason = reason
 
+    _PRESERVE_SCAN_ACTION_PREFIXES = (
+        "OPEN_",
+        "CLOSE_",
+        "SKIPPED_",
+        "BLOCKED_",
+        "EXIT_PENDING_",
+        "RISK_",
+    )
+
+    def _finalize_scan_heartbeat(
+        self,
+        *,
+        direction: str,
+        signal: dict,
+        live_price: float,
+        pos: Optional[Position],
+    ) -> None:
+        """Mark this iteration as a visible SCAN row for the dashboard activity feed."""
+        with self.state._lock:
+            action = str(self.state.last_action or "")
+            if any(action.startswith(prefix) for prefix in self._PRESERVE_SCAN_ACTION_PREFIXES):
+                return
+            self.state.last_action = "SCAN"
+            self.state.last_event = "SCAN"
+            if pos is not None:
+                trail = " · trail ON" if pos.trail_active else ""
+                self.state.last_reason = (
+                    f"Scan Complete: Managing open {pos.side} @ ${live_price:,.2f} "
+                    f"(entry ${pos.entry_price:,.2f}, TP ${pos.take_profit_price:,.2f}, "
+                    f"SL ${pos.stop_loss_price:,.2f}{trail})."
+                )
+                return
+            if config.is_xgboost_ml_profile():
+                p_long = signal["prob_long"] * 100.0
+                p_short = signal["prob_short"] * 100.0
+                long_thr = self._long_threshold * 100.0
+                short_thr = self._short_threshold * 100.0
+                if direction == "CASH":
+                    self.state.last_reason = (
+                        "Scan Complete: Model checked, staying FLAT | "
+                        f"LONG {p_long:.1f}%/{long_thr:.1f}% | "
+                        f"SHORT {p_short:.1f}%/{short_thr:.1f}%"
+                    )
+                else:
+                    self.state.last_reason = (
+                        f"Scan Complete: Model signal {direction} | "
+                        f"LONG {p_long:.1f}%/{long_thr:.1f}% | "
+                        f"SHORT {p_short:.1f}%/{short_thr:.1f}%"
+                    )
+                return
+            self.state.last_reason = (
+                f"Scan Complete: Darvas scan -> {direction} @ ${live_price:,.2f}."
+            )
+
     def _close_partial_position(
         self,
         pos: Position,
@@ -1837,6 +1917,8 @@ class TradingBot:
             self.store.log_status(row)
         except Exception as exc:  # pragma: no cover - disk issues
             logger.error("Failed to write status row: %s", exc)
+        if not transition:
+            self._write_runtime_snapshot()
         if transition:
             self._transition_logged = True
 
@@ -1851,13 +1933,12 @@ class TradingBot:
         if candles.empty:
             msg = "No live candles returned — possible data/API outage."
             logger.warning(msg)
-            with self.state._lock:
-                self.state.connection_degraded = True
-                self.state.connection_error = msg
-                self.state.last_action = "HOLD"
-                self.state.last_event = "WARNING"
-                self.state.last_reason = msg
+            self._mark_stale_data(msg)
             send_alert("WARNING", "Stale market data", msg, key="empty_candles")
+            with self.state._lock:
+                self.state.last_action = "SCAN"
+                self.state.last_event = "SCAN"
+                self.state.last_reason = f"Scan Complete: STALE — {msg}"
             self._log_status(self.state.last_price or 0.0)
             return
 
@@ -1898,7 +1979,18 @@ class TradingBot:
         entry_brackets: Optional[tuple[float, float]] = None
         signal_label = "XGBoost"
         if config.is_xgboost_ml_profile():
-            signal = model_brain.predict_latest(self._model, candles)
+            try:
+                signal = model_brain.predict_latest(self._model, candles)
+            except (ValueError, IndexError, KeyError) as exc:
+                msg = f"Inference unavailable: {exc}"
+                logger.warning(msg)
+                self._mark_stale_data(msg)
+                with self.state._lock:
+                    self.state.last_action = "SCAN"
+                    self.state.last_event = "SCAN"
+                    self.state.last_reason = f"Scan Complete: STALE — {msg}"
+                self._log_status(live_price)
+                return
             direction = model_brain.decide_direction(
                 signal["prob_long"],
                 signal["prob_short"],
@@ -1907,6 +1999,7 @@ class TradingBot:
                 self._short_threshold,
                 price_vs_ema50=signal.get("price_vs_ema50", 0.0),
                 prob_cash=signal.get("prob_cash"),
+                use_ema50_gate=False,
             )
             self._log_directional_signal(signal, direction)
         else:
@@ -1996,7 +2089,7 @@ class TradingBot:
                     f"TP ${pos.take_profit_price:,.2f}, SL ${pos.stop_loss_price:,.2f}, "
                     f"bar {bars_held}/{config.FORWARD_WINDOW}{trail_note}."
                 )
-            if config.EXECUTION_AUDIT_PARITY and bars_held >= config.FORWARD_WINDOW:
+            if config.use_forward_window_exit() and bars_held >= config.FORWARD_WINDOW:
                 logger.warning(
                     "TIMEOUT exit triggered — %s held %d/%d bars without organic TP/SL.",
                     pos.side,
@@ -2101,11 +2194,17 @@ class TradingBot:
                     )
                 self._set_reason("CASH", "HOLD", cash_reason)
 
-        # Heartbeat row — skipped when a transition already logged itself this
-        # iteration so the terminal shows exactly one row per discrete event.
+        # Scan heartbeat — one SQLite row every iteration (visible in Session Activity).
         if not self._transition_logged:
+            self._finalize_scan_heartbeat(
+                direction=direction,
+                signal=signal,
+                live_price=live_price,
+                pos=self.state.position,
+            )
             self._log_status(price)
-        self._write_runtime_snapshot()
+        else:
+            self._write_runtime_snapshot()
 
     def _write_runtime_snapshot(self) -> None:
         import bot_runtime
@@ -2144,7 +2243,10 @@ class TradingBot:
                     "consecutive_losses": risk_snap.consecutive_losses,
                 },
             }
-        bot_runtime.write_runtime_snapshot(payload)
+        try:
+            bot_runtime.write_runtime_snapshot(payload)
+        except Exception as exc:  # pragma: no cover - disk issues
+            logger.warning("Runtime snapshot write failed: %s", exc)
 
     def _cash_reason(self, signal: dict) -> str:
         """Build a verbose explanation for staying in CASH."""
@@ -2253,13 +2355,39 @@ class TradingBot:
         self._log_status(boot_price)
         self._write_runtime_snapshot()
 
-    def _log_iteration_error(self, exc: str) -> None:
+    def _log_iteration_error(self, exc: str, *, degraded: bool = False) -> None:
         """Persist a visible row when an iteration throws (loop stays alive)."""
+        if degraded:
+            with self._api_state_lock:
+                self.state.connection_degraded = True
+                self.state.connection_error = exc
         with self.state._lock:
             self.state.last_action = "ERROR"
             self.state.last_event = "WARNING"
             self.state.last_reason = f"Iteration failed: {exc}"
         self._log_status(self.state.last_price or 0.0)
+
+    @staticmethod
+    def _is_transient_error(exc: Exception) -> bool:
+        """Return True for network / exchange-busy errors worth a short backoff."""
+        msg = str(exc).lower()
+        markers = (
+            "timeout",
+            "timed out",
+            "connection",
+            "network",
+            "busy",
+            "rate limit",
+            "too many requests",
+            "503",
+            "502",
+            "504",
+            "exchange",
+            "remote end closed",
+            "ssl",
+            "temporarily unavailable",
+        )
+        return any(marker in msg for marker in markers)
 
     def _run(self) -> None:
         self._write_runtime_snapshot()
@@ -2312,13 +2440,18 @@ class TradingBot:
                     safe = config.sanitize_for_log(str(exc))
                     self.state.last_error = safe
                     logger.error("Iteration error: %s", safe)
-                    self._log_iteration_error(safe)
+                    transient = self._is_transient_error(exc)
+                    if transient:
+                        self._mark_api_failure(exc, "Iteration")
+                    self._log_iteration_error(safe, degraded=transient)
                     send_alert(
                         "ERROR",
                         "Iteration error",
                         safe,
                         key="iteration_error",
                     )
+                    if transient:
+                        self._stop_event.wait(config.EXCHANGE_RETRY_BASE_DELAY)
                 self._stop_event.wait(config.LOOP_SLEEP_SECONDS)
         finally:
             self.state.running = False

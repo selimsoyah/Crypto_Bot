@@ -93,7 +93,12 @@ def test_active_box_number_increments_on_new_utc_day():
     assert state2.active_box_number == 2
 
 
-def test_box_breakout_long_with_volume_gate():
+def test_box_breakout_long_with_volume_gate(monkeypatch):
+    monkeypatch.setattr(
+        BoxStrategyEngine,
+        "_daily_adx14",
+        staticmethod(lambda frame, ts: 25.0),
+    )
     engine = BoxStrategyEngine(volume_filter_multiplier=1.2)
     candles = _two_day_frame(close=111.0, volume=160.0)
     state = engine.evaluate(candles, daily_high=110.0, daily_low=90.0)

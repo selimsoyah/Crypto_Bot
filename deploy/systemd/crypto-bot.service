@@ -10,6 +10,12 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/Crypto_Bot
 Environment=PATH=/home/ubuntu/Crypto_Bot/venv/bin:/usr/bin
+Environment=ACTIVE_PROFILE=xgboost_ml
+Environment=TRADING_PROFILE=COMPOUND
+Environment=FEATURE_VARIANT=F2
+Environment=USE_EMA50_TREND_GATE=false
+Environment=USE_ATR_BRACKETS=false
+Environment=EXECUTION_AUDIT_PARITY=false
 ExecStart=/home/ubuntu/Crypto_Bot/venv/bin/python bot_loop.py
 Restart=on-failure
 RestartSec=10
