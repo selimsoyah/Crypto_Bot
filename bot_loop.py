@@ -1363,6 +1363,18 @@ class TradingBot:
             logger.warning(reason)
             return
 
+        if config.is_xgboost_ml_profile() and config.CONFLUENCE_GATE_ENABLED:
+            from confluence_gate import verify_btc_trade_safety
+
+            if not verify_btc_trade_safety(direction, store=self.store):
+                reason = (
+                    f"Confluence Gate VETO — cross-market altcoin sentiment blocked "
+                    f"local BTC {direction}. Model signal intercepted; staying FLAT."
+                )
+                self._set_reason("WARNING", f"BLOCKED_{direction}_RADAR", reason)
+                logger.warning(reason)
+                return
+
         if self._last_close_at is not None and config.REENTRY_COOLDOWN_SECONDS > 0:
             elapsed = (
                 datetime.now(timezone.utc) - self._last_close_at

@@ -119,6 +119,16 @@ CREATE INDEX IF NOT EXISTS idx_external_signals_ts ON external_signals (timestam
 CREATE INDEX IF NOT EXISTS idx_external_signals_symbol ON external_signals (symbol);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_external_signals_dedup
     ON external_signals (timestamp, symbol);
+
+CREATE TABLE IF NOT EXISTS radar_decisions_log (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp             TEXT NOT NULL,
+    intended_action       TEXT NOT NULL,
+    global_sentiment_pct  REAL NOT NULL,
+    verdict               TEXT NOT NULL,
+    detail                TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_radar_decisions_ts ON radar_decisions_log (timestamp);
 """
 
 
@@ -174,6 +184,17 @@ class ExternalSignal:
     quantity: float
     agent_name: str = "Unknown Agent"
     content: str = ""
+
+
+@dataclass
+class RadarDecision:
+    """One Confluence Gate evaluation logged for dashboard audit."""
+
+    timestamp: str
+    intended_action: str
+    global_sentiment_pct: float
+    verdict: str
+    detail: str = ""
 
 
 class TradeStore:
@@ -243,6 +264,53 @@ class TradeStore:
                 ),
             )
 
+    def log_radar_decision(
+        self,
+        *,
+        timestamp: str,
+        intended_action: str,
+        global_sentiment_pct: float,
+        verdict: str,
+        detail: str = "",
+    ) -> None:
+        """Persist one Confluence Gate check (approve or veto)."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO radar_decisions_log
+                    (timestamp, intended_action, global_sentiment_pct, verdict, detail)
+                VALUES (?,?,?,?,?)
+                """,
+                (
+                    timestamp,
+                    intended_action,
+                    float(global_sentiment_pct),
+                    verdict,
+                    detail,
+                ),
+            )
+
+    def count_radar_vetoes(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM radar_decisions_log WHERE verdict = 'VETO'"
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def read_radar_decisions_df(self, limit: int = 25) -> pd.DataFrame:
+        limit = max(1, int(limit))
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                """
+                SELECT timestamp, intended_action, global_sentiment_pct, verdict, detail
+                FROM radar_decisions_log
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                conn,
+                params=(limit,),
+            )
+
     def external_signal_exists(self, timestamp: str, symbol: str) -> bool:
         """Return True when this timestamp/symbol pair is already stored."""
         with self._connect() as conn:
@@ -285,20 +353,60 @@ class TradeStore:
         return int(row[0]) if row else 0
 
     def top_external_signal_symbol(self) -> str:
+        return self.top_external_signal_symbol_in_window(
+            hours=config.CONFLUENCE_GATE_LOOKBACK_HOURS
+        )
+
+    def top_external_signal_symbol_in_window(self, hours: float) -> str:
         with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT symbol, COUNT(*) AS cnt
                 FROM external_signals
+                WHERE datetime(replace(substr(timestamp, 1, 19), 'T', ' '))
+                      >= datetime('now', ?)
                 GROUP BY symbol
                 ORDER BY cnt DESC, symbol ASC
                 LIMIT 1
-                """
+                """,
+                (f"-{int(hours)} hours",),
             ).fetchone()
         return str(row[0]) if row else "—"
 
-    def external_market_bias(self, hours: float = 12.0) -> dict[str, object]:
+    def external_symbol_activity(
+        self,
+        hours: float,
+        *,
+        limit: int = 8,
+    ) -> pd.DataFrame:
+        """Per-symbol operation counts inside the gate lookback window."""
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                """
+                SELECT symbol,
+                       SUM(CASE WHEN UPPER(action) IN ('BUY', 'COVER') THEN 1 ELSE 0 END) AS bullish_ops,
+                       SUM(CASE WHEN UPPER(action) IN ('SELL', 'SHORT') THEN 1 ELSE 0 END) AS bearish_ops,
+                       COUNT(*) AS total_ops
+                FROM external_signals
+                WHERE datetime(replace(substr(timestamp, 1, 19), 'T', ' '))
+                      >= datetime('now', ?)
+                GROUP BY symbol
+                ORDER BY total_ops DESC, symbol ASC
+                LIMIT ?
+                """,
+                conn,
+                params=(f"-{int(hours)} hours", int(limit)),
+            )
+
+    def external_market_bias(
+        self, hours: float | None = None,
+    ) -> dict[str, object]:
         """Aggregate BUY/SHORT sentiment over the recent window."""
+        window = (
+            float(hours)
+            if hours is not None
+            else config.CONFLUENCE_GATE_LOOKBACK_HOURS
+        )
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -308,7 +416,7 @@ class TradeStore:
                       >= datetime('now', ?)
                 GROUP BY action
                 """,
-                (f"-{int(hours)} hours",),
+                (f"-{int(window)} hours",),
             ).fetchall()
 
         bullish_actions = {"BUY", "COVER"}

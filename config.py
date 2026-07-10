@@ -430,6 +430,24 @@ RADIO_TOWER_RETRY_SECONDS: Final[int] = int(_env("RADIO_TOWER_RETRY_SECONDS", "3
 RADIO_TOWER_HTTP_TIMEOUT: Final[float] = float(_env("RADIO_TOWER_HTTP_TIMEOUT", "30"))
 
 # --------------------------------------------------------------------------- #
+# Confluence Gate — cross-market BTC filter (Radio Tower intermarket analysis) #
+# --------------------------------------------------------------------------- #
+CONFLUENCE_GATE_ENABLED: Final[bool] = _env("CONFLUENCE_GATE_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+CONFLUENCE_GATE_LOOKBACK_HOURS: Final[float] = float(
+    _env("CONFLUENCE_GATE_LOOKBACK_HOURS", "4")
+)
+CONFLUENCE_LONG_MIN_BULLISH_PCT: Final[float] = float(
+    _env("CONFLUENCE_LONG_MIN_BULLISH_PCT", "40")
+)
+CONFLUENCE_SHORT_MAX_BULLISH_PCT: Final[float] = float(
+    _env("CONFLUENCE_SHORT_MAX_BULLISH_PCT", "60")
+)
+
+# --------------------------------------------------------------------------- #
 # Live execution — audit-parity maker fills (COMPOUND / F2 audit alignment)   #
 # --------------------------------------------------------------------------- #
 # When true: fixed config brackets, no ATR scaling, no trailing stop, and

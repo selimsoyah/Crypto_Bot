@@ -7,6 +7,7 @@ import sys
 os.environ.setdefault("TRADING_PROFILE", "SWING")
 os.environ.setdefault("ACTIVE_PROFILE", "xgboost_ml")
 os.environ.setdefault("RADIO_TOWER_ENABLED", "false")
+os.environ.setdefault("CONFLUENCE_GATE_ENABLED", "false")
 
 import pandas as pd
 import pytest

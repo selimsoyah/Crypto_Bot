@@ -451,10 +451,14 @@ def status_to_activity_rows(log: pd.DataFrame, max_rows: int = 60) -> list[dict]
 
     rows: list[dict] = []
     for _, row in log.iterrows():
-        action = str(row.get("Action", "") or "")
+        raw_action = str(row.get("Action", "") or "")
         event = str(row.get("Event", "") or "")
-        if not _is_activity_row(action, event):
+        if not _is_activity_row(raw_action, event):
             continue
+
+        action = raw_action
+        if "RADAR" in raw_action:
+            action = raw_action.replace("BLOCKED_", "🛡️ ")
 
         ts = _parse_ts(str(row.get("Timestamp", "")))
         time_str = ts.strftime("%H:%M:%S") if ts is not None and pd.notna(ts) else "--:--:--"
@@ -463,13 +467,15 @@ def status_to_activity_rows(log: pd.DataFrame, max_rows: int = 60) -> list[dict]
             reason = reason[:117] + "..."
 
         tone = "info"
-        if action == "SCAN" or event == "SCAN":
+        if raw_action == "SCAN" or event == "SCAN":
             tone = "scan"
-        elif action.startswith(("SKIPPED_", "BLOCKED_", "EXIT_PENDING_")) or event == "WARNING":
+        elif "RADAR" in raw_action:
+            tone = "radar"
+        elif raw_action.startswith(("SKIPPED_", "BLOCKED_", "EXIT_PENDING_")) or event == "WARNING":
             tone = "warn"
-        elif action.startswith("OPEN_") or event in ("BUY_LONG", "SHORT_ORDER"):
+        elif raw_action.startswith("OPEN_") or event in ("BUY_LONG", "SHORT_ORDER"):
             tone = "open"
-        elif action.startswith("CLOSE_") or event in ("STOP_LOSS", "FILL_SUCCESS"):
+        elif raw_action.startswith("CLOSE_") or event in ("STOP_LOSS", "FILL_SUCCESS"):
             tone = "close"
 
         rows.append(
@@ -898,36 +904,111 @@ def darvas_box_stats(
     }
 
 
+def confluence_desk_summary(store) -> dict[str, object]:
+    """Compact gate snapshot for the Trading Desk — same rules as ``bot_loop``."""
+    if not config.is_xgboost_ml_profile():
+        return {"visible": False}
+    window = config.CONFLUENCE_GATE_LOOKBACK_HOURS
+    if not config.CONFLUENCE_GATE_ENABLED:
+        return {
+            "visible": True,
+            "gate_enabled": False,
+            "lookback_hours": window,
+            "insight": "Confluence Gate is OFF — only your local XGBoost model filters BTC entries.",
+            "insight_tone": "info",
+        }
+    try:
+        from confluence_gate import gate_readiness_snapshot
+
+        readiness = gate_readiness_snapshot(store, hours=window)
+        vetoes = store.count_radar_vetoes()
+    except Exception as exc:
+        return {
+            "visible": True,
+            "gate_enabled": True,
+            "error": str(exc),
+            "insight": f"Could not load fleet sentiment: {exc}",
+            "insight_tone": "warning",
+        }
+    return {
+        "visible": True,
+        "gate_enabled": True,
+        "lookback_hours": window,
+        "total_vetoes": vetoes,
+        "readiness": readiness,
+        "bullish_pct": float(readiness.get("bullish_pct", 0.0)),
+        "insight": str(readiness.get("insight", "")),
+        "insight_tone": str(readiness.get("insight_tone", "info")),
+        "error": "",
+    }
+
+
 def radio_tower_metrics(store) -> dict[str, object]:
     """Summary metrics for the Global AI Radio Tower dashboard panel."""
+    window = config.CONFLUENCE_GATE_LOOKBACK_HOURS
     try:
+        from confluence_gate import gate_readiness_snapshot
+
         total = store.count_external_signals()
-        top_symbol = store.top_external_signal_symbol()
-        bias = store.external_market_bias(hours=12.0)
+        readiness = gate_readiness_snapshot(store, hours=window)
+        top_symbol = store.top_external_signal_symbol_in_window(window)
+        symbol_activity = store.external_symbol_activity(window, limit=8)
         latest = store.read_external_signals_df(limit=15)
+        vetoes = store.count_radar_vetoes()
+        audit = store.read_radar_decisions_df(limit=25)
     except Exception as exc:
         return {
             "total": 0,
             "top_symbol": "—",
-            "bias_label": "NEUTRAL",
-            "bias_detail": "No data yet",
+            "readiness": {},
+            "symbol_activity": pd.DataFrame(),
             "latest": pd.DataFrame(),
+            "total_vetoes": 0,
+            "audit": pd.DataFrame(),
             "error": str(exc),
         }
 
-    bias_label = str(bias.get("label", "NEUTRAL"))
-    bullish_pct = float(bias.get("bullish_pct", 0.0))
-    bearish_pct = float(bias.get("bearish_pct", 0.0))
+    bullish_pct = float(readiness.get("bullish_pct", 0.0))
+    bearish_pct = float(readiness.get("bearish_pct", 0.0))
     return {
         "total": total,
         "top_symbol": top_symbol,
-        "bias_label": bias_label,
-        "bias_detail": (
-            f"{bullish_pct:.0f}% bullish · {bearish_pct:.0f}% bearish (12h)"
-        ),
+        "readiness": readiness,
+        "symbol_activity": symbol_activity,
         "latest": latest,
+        "total_vetoes": vetoes,
+        "audit": audit,
+        "lookback_hours": window,
+        "core_sentiment_pct": bullish_pct,
+        "core_sentiment_detail": (
+            f"{bullish_pct:.1f}% bullish · {bearish_pct:.1f}% bearish · "
+            f"{int(readiness.get('total_ops', 0))} fleet ops / {window:.0f}h"
+        ),
         "error": "",
     }
+
+
+def confluence_radar_metrics(store) -> dict[str, object]:
+    """Backward-compatible wrapper — prefer :func:`radio_tower_metrics`."""
+    metrics = radio_tower_metrics(store)
+    readiness = metrics.get("readiness", {}) or {}
+    return {
+        "core_sentiment_pct": metrics.get("core_sentiment_pct", 0.0),
+        "core_sentiment_detail": metrics.get("core_sentiment_detail", ""),
+        "total_vetoes": metrics.get("total_vetoes", 0),
+        "audit": metrics.get("audit", pd.DataFrame()),
+        "readiness": readiness,
+        "error": metrics.get("error", ""),
+    }
+
+
+def format_radar_verdict(verdict: str) -> str:
+    verdict_u = str(verdict or "").upper()
+    if verdict_u == "VETO":
+        return "🔴 VETOED"
+    if verdict_u == "APPROVE":
+        return "🟢 APPROVED"
+    return verdict_u
 
 
 def format_external_action_tag(action: str) -> str:

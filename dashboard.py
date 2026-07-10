@@ -210,6 +210,7 @@ st.markdown(
 }
 .row-good td { color: #22c55e; }
 .row-warn td { color: #f59e0b; }
+.row-radar td { color: #f97316; font-weight: 600; }
 .row-bad  td { color: #ef4444; }
 .row-live td {
     color: #22c55e;
@@ -872,6 +873,8 @@ def render_activity(log_df: pd.DataFrame) -> None:
             cls = "row-bad"
         elif tone == "scan":
             cls = "row-scan"
+        elif tone == "radar":
+            cls = "row-radar"
         elif tone == "warn":
             cls = "row-warn"
         else:
@@ -894,43 +897,239 @@ def render_activity(log_df: pd.DataFrame) -> None:
     )
 
 
+def render_confluence_gate_desk(store) -> None:
+    """Compact cross-market gate panel — mirrors live ``bot_loop`` veto rules."""
+    summary = dashboard_stats.confluence_desk_summary(store)
+    if not summary.get("visible"):
+        return
+
+    window_h = float(summary.get("lookback_hours", config.CONFLUENCE_GATE_LOOKBACK_HOURS))
+    st.markdown("#### Cross-Market Confluence Gate")
+    st.caption(
+        f"Your bot trades **{config.SYMBOL}** only. Fleet altcoin ops ({window_h:.0f}h window) "
+        "must align before the local model can open BTC — same check as `verify_btc_trade_safety`."
+    )
+
+    if summary.get("error"):
+        st.warning(str(summary["error"]))
+
+    insight = str(summary.get("insight", ""))
+    tone = str(summary.get("insight_tone", "info"))
+    if insight:
+        if tone == "success":
+            st.success(insight)
+        elif tone == "warning":
+            st.warning(insight)
+        else:
+            st.info(insight)
+
+    if not summary.get("gate_enabled"):
+        return
+
+    readiness = summary.get("readiness") or {}
+    long_ok = bool(readiness.get("long_allowed", True))
+    short_ok = bool(readiness.get("short_allowed", True))
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric(
+            f"Fleet bullish ({window_h:.0f}h)",
+            f"{float(summary.get('bullish_pct', 0.0)):.1f}%",
+            str(readiness.get("long_status", "")),
+        )
+    with c2:
+        st.metric(
+            "BTC LONG",
+            "OPEN" if long_ok else "BLOCKED",
+            f"needs ≥{config.CONFLUENCE_LONG_MIN_BULLISH_PCT:.0f}% bullish",
+        )
+    with c3:
+        st.metric(
+            "BTC SHORT",
+            "OPEN" if short_ok else "BLOCKED",
+            f"needs ≤{config.CONFLUENCE_SHORT_MAX_BULLISH_PCT:.0f}% bullish",
+        )
+    with c4:
+        st.metric(
+            "Lifetime vetoes",
+            int(summary.get("total_vetoes", 0)),
+            "local entries stopped by gate",
+        )
+    st.caption(
+        "Full fleet stream, per-symbol breakdown, and audit log → "
+        "**📡 Global AI Radio Tower** tab."
+    )
+
+
 def render_radio_tower(store) -> None:
     """Global AI Radio Tower — read-only fleet observation panel."""
     st.subheader("📡 Global AI Radio Tower")
 
-    with st.expander("What is the Radio Tower?", expanded=True):
+    window_h = config.CONFLUENCE_GATE_LOOKBACK_HOURS
+    st.caption(
+        f"Local bot trades **{config.SYMBOL}** only · Gate uses **{window_h:.0f}h** fleet data "
+        f"(all crypto symbols: BTC, SOL, AVAX, NEAR, …) · Poll every "
+        f"{config.RADIO_TOWER_POLL_SECONDS}s"
+    )
+
+    with st.expander("What is the Radio Tower?", expanded=False):
         st.info(
-            "Welcome to the Radio Tower. Instead of guessing market patterns in isolation, "
-            "your system is listening to the live operational frequencies of the global "
-            "ai4trade.ai fleet. Observe, learn, and cross-reference features from the "
-            "best AI trading agents in the world **without exposing your capital or API keys** "
-            "to external environments."
+            "Instead of trading in isolation, your engine listens to live operations from the "
+            "global **ai4trade.ai** agent fleet. The **Confluence Gate** applies the same "
+            f"**{window_h:.0f}-hour** bullish/bearish math your bot uses before every BTC entry — "
+            "what you see here is exactly what can veto or approve local orders."
         )
         st.caption(
-            "READ-ONLY analytical mode — external signals are never routed to your exchange account."
+            "READ-ONLY — fleet signals never touch your exchange API keys or place orders."
         )
 
     metrics = dashboard_stats.radio_tower_metrics(store)
     if metrics.get("error"):
         st.warning(f"Could not load Radio Tower data: {metrics['error']}")
 
-    c1, c2, c3 = st.columns(3)
+    readiness = metrics.get("readiness") or {}
+    insight = str(readiness.get("insight", ""))
+    tone = str(readiness.get("insight_tone", "info"))
+    if insight:
+        if tone == "success":
+            st.success(insight)
+        elif tone == "warning":
+            st.warning(insight)
+        else:
+            st.info(insight)
+
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("Active Signals Tracked", int(metrics.get("total", 0)))
+        st.metric("Fleet Signals (all time)", int(metrics.get("total", 0)))
     with c2:
-        st.metric("Top Traded Token", str(metrics.get("top_symbol", "—")))
+        st.metric(
+            f"Gate Sentiment ({window_h:.0f}h)",
+            f"{float(metrics.get('core_sentiment_pct', 0.0)):.1f}%",
+            str(metrics.get("core_sentiment_detail", "")),
+        )
     with c3:
-        bias = str(metrics.get("bias_label", "NEUTRAL"))
-        st.metric("Market Bias (12h)", bias, metrics.get("bias_detail", ""))
+        st.metric(
+            f"Hottest Token ({window_h:.0f}h)",
+            str(metrics.get("top_symbol", "—")),
+            "Most fleet operations in gate window",
+        )
+    with c4:
+        st.metric(
+            "BTC Vetoes (lifetime)",
+            int(metrics.get("total_vetoes", 0)),
+            "Blocked local entries",
+        )
+
+    st.markdown("#### 🛡️ Confluence Gate — matches live bot rules")
+    with st.expander("How does Cross-Market Correlation work?", expanded=False):
+        st.write(
+            "Altcoin momentum (SOL, AVAX, NEAR, etc.) acts as a **canary** for broader crypto risk. "
+            "When the global AI fleet is dumping alts, your bot blocks **BTC LONG** entries even if "
+            "the local XGBoost model says buy. When the fleet is aggressively buying alts, "
+            "**BTC SHORT** entries are blocked to avoid fighting a risk-on tape."
+        )
+        st.markdown(
+            f"- **BTC LONG** allowed when fleet ≥ **{config.CONFLUENCE_LONG_MIN_BULLISH_PCT:.0f}%** bullish "
+            f"(buy + cover share)\n"
+            f"- **BTC SHORT** allowed when fleet ≤ **{config.CONFLUENCE_SHORT_MAX_BULLISH_PCT:.0f}%** bullish\n"
+            f"- **Lookback:** {window_h:.0f} hours — same window as `confluence_gate.py` in `bot_loop.py`"
+        )
+
+    g1, g2 = st.columns(2)
+    long_ok = bool(readiness.get("long_allowed", True))
+    short_ok = bool(readiness.get("short_allowed", True))
+    with g1:
+        st.metric(
+            "BTC LONG Gate",
+            "🟢 OPEN" if long_ok else "🔴 BLOCKED",
+            str(readiness.get("long_status", "—")),
+        )
+    with g2:
+        st.metric(
+            "BTC SHORT Gate",
+            "🟢 OPEN" if short_ok else "🔴 BLOCKED",
+            str(readiness.get("short_status", "—")),
+        )
+
+    activity = metrics.get("symbol_activity")
+    if isinstance(activity, pd.DataFrame) and not activity.empty:
+        st.markdown(f"##### Fleet activity by symbol ({window_h:.0f}h gate window)")
+        act = activity.copy()
+        act["Net bias"] = act.apply(
+            lambda r: (
+                "Bullish"
+                if int(r["bullish_ops"]) > int(r["bearish_ops"])
+                else ("Bearish" if int(r["bearish_ops"]) > int(r["bullish_ops"]) else "Mixed")
+            ),
+            axis=1,
+        )
+        st.dataframe(
+            act.rename(
+                columns={
+                    "symbol": "Symbol",
+                    "bullish_ops": "Buy/Cover",
+                    "bearish_ops": "Sell/Short",
+                    "total_ops": "Total ops",
+                }
+            )[["Symbol", "Buy/Cover", "Sell/Short", "Total ops", "Net bias"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "These alt flows drive the gate percentage above — not shown on the Trading Desk "
+            "because your bot only executes on BTCUSDT."
+        )
+
+    audit = metrics.get("audit")
+    st.markdown("##### 🛡️ Radar Execution Filter Log")
+    if not isinstance(audit, pd.DataFrame) or audit.empty:
+        st.caption(
+            "No gate checks logged yet. Each time the local model tries to open BTC, a row is "
+            "written here (approve or veto)."
+        )
+    else:
+        audit_display = audit.copy()
+        audit_display["Final Verdict"] = audit_display["verdict"].map(
+            dashboard_stats.format_radar_verdict
+        )
+        audit_display = audit_display.rename(
+            columns={
+                "timestamp": "Time",
+                "intended_action": "Intended BTC Trade",
+                "global_sentiment_pct": f"Gate Sentiment ({window_h:.0f}h %)",
+            }
+        )
+        audit_display[f"Gate Sentiment ({window_h:.0f}h %)"] = audit_display[
+            f"Gate Sentiment ({window_h:.0f}h %)"
+        ].map(lambda v: f"{float(v):.1f}% bullish")
+        st.dataframe(
+            audit_display[
+                [
+                    "Time",
+                    "Intended BTC Trade",
+                    f"Gate Sentiment ({window_h:.0f}h %)",
+                    "Final Verdict",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        with st.expander("Filter decision details", expanded=False):
+            for _, row in audit.iterrows():
+                st.markdown(
+                    f"**{row.get('timestamp', '')} · {row.get('intended_action', '')} · "
+                    f"{dashboard_stats.format_radar_verdict(str(row.get('verdict', '')))}**"
+                )
+                st.caption(str(row.get("detail", "") or "—"))
 
     latest = metrics.get("latest")
     if not isinstance(latest, pd.DataFrame) or latest.empty:
         st.info(
-            "No external signals stored yet. Start the bot engine (Radio Tower poller runs "
-            "in the background every 60s) or wait for the next feed sync."
+            "No external signals stored yet. Start the bot engine — Radio Tower polls every "
+            f"{config.RADIO_TOWER_POLL_SECONDS}s and fills the gate window automatically."
         )
         return
 
+    st.markdown("##### Global Signal Stream (latest fleet operations)")
     search = st.text_input("Search agent notes", placeholder="Filter strategy content…")
     display = latest.copy()
     if search.strip():
@@ -1230,6 +1429,9 @@ with desk_tab:
         f"Action: {health['last_action']} · Position: {health['open_position']}"
     )
     st.caption(health["detail"])
+
+    if config.is_xgboost_ml_profile():
+        render_confluence_gate_desk(get_store())
 
     metrics = dashboard_stats.essential_metrics(
         trades_df,
