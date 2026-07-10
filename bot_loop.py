@@ -846,6 +846,11 @@ class TradingBot:
         self._darvas_daily_high: Optional[float] = None
         self._darvas_daily_low: Optional[float] = None
         self._darvas_consumed_signal_ts: Optional[str] = None
+        self._radio_tower = None
+        if config.RADIO_TOWER_ENABLED:
+            from radio_tower import RadioTowerListener
+
+            self._radio_tower = RadioTowerListener(self.store)
         if not _skip_session_recovery:
             recover_orphan_session_export(self.store)
 
@@ -2433,6 +2438,8 @@ class TradingBot:
                 self.session_id,
             )
             self._write_boot_status()
+            if self._radio_tower is not None:
+                self._radio_tower.start()
             while not self._stop_event.is_set():
                 try:
                     self._iteration()
@@ -2454,6 +2461,8 @@ class TradingBot:
                         self._stop_event.wait(config.EXCHANGE_RETRY_BASE_DELAY)
                 self._stop_event.wait(config.LOOP_SLEEP_SECONDS)
         finally:
+            if self._radio_tower is not None:
+                self._radio_tower.stop()
             self.state.running = False
             try:
                 import bot_runtime

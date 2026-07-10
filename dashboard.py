@@ -894,6 +894,92 @@ def render_activity(log_df: pd.DataFrame) -> None:
     )
 
 
+def render_radio_tower(store) -> None:
+    """Global AI Radio Tower — read-only fleet observation panel."""
+    st.subheader("📡 Global AI Radio Tower")
+
+    with st.expander("What is the Radio Tower?", expanded=True):
+        st.info(
+            "Welcome to the Radio Tower. Instead of guessing market patterns in isolation, "
+            "your system is listening to the live operational frequencies of the global "
+            "ai4trade.ai fleet. Observe, learn, and cross-reference features from the "
+            "best AI trading agents in the world **without exposing your capital or API keys** "
+            "to external environments."
+        )
+        st.caption(
+            "READ-ONLY analytical mode — external signals are never routed to your exchange account."
+        )
+
+    metrics = dashboard_stats.radio_tower_metrics(store)
+    if metrics.get("error"):
+        st.warning(f"Could not load Radio Tower data: {metrics['error']}")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Active Signals Tracked", int(metrics.get("total", 0)))
+    with c2:
+        st.metric("Top Traded Token", str(metrics.get("top_symbol", "—")))
+    with c3:
+        bias = str(metrics.get("bias_label", "NEUTRAL"))
+        st.metric("Market Bias (12h)", bias, metrics.get("bias_detail", ""))
+
+    latest = metrics.get("latest")
+    if not isinstance(latest, pd.DataFrame) or latest.empty:
+        st.info(
+            "No external signals stored yet. Start the bot engine (Radio Tower poller runs "
+            "in the background every 60s) or wait for the next feed sync."
+        )
+        return
+
+    search = st.text_input("Search agent notes", placeholder="Filter strategy content…")
+    display = latest.copy()
+    if search.strip():
+        mask = display["content"].astype(str).str.contains(
+            search.strip(), case=False, na=False
+        ) | display["agent_name"].astype(str).str.contains(
+            search.strip(), case=False, na=False
+        ) | display["symbol"].astype(str).str.contains(
+            search.strip(), case=False, na=False
+        )
+        display = display.loc[mask]
+
+    display = display.rename(
+        columns={
+            "timestamp": "Time (UTC)",
+            "symbol": "Symbol",
+            "action": "Action",
+            "price": "Price",
+            "quantity": "Qty",
+            "agent_name": "Agent",
+            "content": "Strategy / Notes",
+        }
+    )
+    display["Action"] = display["Action"].map(dashboard_stats.format_external_action_tag)
+
+    show_cols = [
+        "Time (UTC)",
+        "Symbol",
+        "Action",
+        "Price",
+        "Qty",
+        "Agent",
+        "Strategy / Notes",
+    ]
+    st.dataframe(
+        display[show_cols],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    with st.expander("Raw signal details", expanded=False):
+        for _, row in latest.iterrows():
+            title = f"{row.get('agent_name', 'Agent')} · {row.get('symbol', '')} · {row.get('action', '')}"
+            with st.container():
+                st.markdown(f"**{title}**")
+                st.caption(str(row.get("timestamp", "")))
+                st.write(str(row.get("content", "") or "—"))
+
+
 def render_closed_trades(trades_df: pd.DataFrame, exchange_pos: Optional[dict]) -> None:
     st.subheader("Closed Trades")
     rows = dashboard_stats.trades_to_log_rows(trades_df)
@@ -1095,90 +1181,97 @@ render_sidebar_controls(
 
 st.title("BTC/USDT ML Futures Desk")
 render_venue_banner()
-render_profile_badge(darvas_box_stats if config.is_darvas_box_profile() else None)
 
-exchange_pos = fetch_live_position()
-if (
-    exchange_pos.get("status") == "error"
-    and "No module named 'binance'" in str(exchange_pos.get("message", ""))
-):
-    st.warning(
-        "Exchange client dependency missing in this Python environment. "
-        "Install with: `pip install -r requirements.txt` (or `pip install python-binance`)."
+desk_tab, radio_tab = st.tabs(["Trading Desk", "📡 Global AI Radio Tower"])
+
+with radio_tab:
+    render_radio_tower(get_store())
+
+with desk_tab:
+    render_profile_badge(darvas_box_stats if config.is_darvas_box_profile() else None)
+
+    exchange_pos = fetch_live_position()
+    if (
+        exchange_pos.get("status") == "error"
+        and "No module named 'binance'" in str(exchange_pos.get("message", ""))
+    ):
+        st.warning(
+            "Exchange client dependency missing in this Python environment. "
+            "Install with: `pip install -r requirements.txt` (or `pip install python-binance`)."
+        )
+
+    recon = dashboard_stats.reconcile_manual_exchange_close(
+        store=get_store(),
+        log=log_df,
+        trades=trades_df,
+        exchange_pos=exchange_pos,
+        client=_futures_client(),
     )
+    if recon.get("inserted"):
+        log_df = load_log()
+        trades_df = load_trades()
+        st.success(recon.get("message", "Manual exchange close reconciled."))
 
-recon = dashboard_stats.reconcile_manual_exchange_close(
-    store=get_store(),
-    log=log_df,
-    trades=trades_df,
-    exchange_pos=exchange_pos,
-    client=_futures_client(),
-)
-if recon.get("inserted"):
-    log_df = load_log()
-    trades_df = load_trades()
-    st.success(recon.get("message", "Manual exchange close reconciled."))
+    stats = dashboard_stats.compute_stats(log_df, trades_df)
+    mismatch = dashboard_stats.position_mismatch_warning(log_df, exchange_pos)
+    if mismatch:
+        stats.setdefault("data_warnings", []).append(mismatch)
+    for warning in stats.get("data_warnings", []):
+        st.warning(warning)
 
-stats = dashboard_stats.compute_stats(log_df, trades_df)
-mismatch = dashboard_stats.position_mismatch_warning(log_df, exchange_pos)
-if mismatch:
-    stats.setdefault("data_warnings", []).append(mismatch)
-for warning in stats.get("data_warnings", []):
-    st.warning(warning)
+    health = dashboard_stats.bot_health(
+        None,
+        log_df,
+        exchange_pos=exchange_pos,
+        runtime=engine_status,
+    )
+    st.info(
+        f"Engine: {health['status']} · Last scan: {health['last_scan']} · "
+        f"Action: {health['last_action']} · Position: {health['open_position']}"
+    )
+    st.caption(health["detail"])
 
-health = dashboard_stats.bot_health(
-    None,
-    log_df,
-    exchange_pos=exchange_pos,
-    runtime=engine_status,
-)
-st.info(
-    f"Engine: {health['status']} · Last scan: {health['last_scan']} · "
-    f"Action: {health['last_action']} · Position: {health['open_position']}"
-)
-st.caption(health["detail"])
-
-metrics = dashboard_stats.essential_metrics(
-    trades_df,
-    log_df,
-    exchange_pos=exchange_pos,
-    runtime_snapshot=runtime_snapshot,
-)
-render_threshold_circles(stats)
-render_top_metrics(metrics)
-
-if config.is_compound_profile():
-    comp = dashboard_stats.compute_compound_metrics(
+    metrics = dashboard_stats.essential_metrics(
         trades_df,
+        log_df,
+        exchange_pos=exchange_pos,
         runtime_snapshot=runtime_snapshot,
     )
-else:
-    comp = None
-render_compound_and_position(
-    comp,
-    exchange_pos,
-    log_df=log_df,
-    runtime_snapshot=runtime_snapshot,
-)
-
-left, right = st.columns([1, 1], gap="large")
-with left:
-    render_activity(log_df)
-with right:
-    render_closed_trades(trades_df, exchange_pos)
-
-st.subheader("Chart")
-if config.is_darvas_box_profile():
-    render_darvas_price_chart(chart_candles, darvas_box_stats)
-    with st.expander("TradingView reference", expanded=False):
-        render_tradingview(symbol="BINANCE:BTCUSDT.P", height=420)
-else:
-    render_tradingview(symbol="BINANCE:BTCUSDT.P", height=480)
-
-with st.expander("Model thresholds & probabilities", expanded=False):
     render_threshold_circles(stats)
+    render_top_metrics(metrics)
 
-st.caption(
-    f"Auto-refresh: {'on' if _AUTOREFRESH else 'manual'} · "
-    f"Store: {os.path.basename(config.DB_FILE)}"
-)
+    if config.is_compound_profile():
+        comp = dashboard_stats.compute_compound_metrics(
+            trades_df,
+            runtime_snapshot=runtime_snapshot,
+        )
+    else:
+        comp = None
+    render_compound_and_position(
+        comp,
+        exchange_pos,
+        log_df=log_df,
+        runtime_snapshot=runtime_snapshot,
+    )
+
+    left, right = st.columns([1, 1], gap="large")
+    with left:
+        render_activity(log_df)
+    with right:
+        render_closed_trades(trades_df, exchange_pos)
+
+    st.subheader("Chart")
+    if config.is_darvas_box_profile():
+        render_darvas_price_chart(chart_candles, darvas_box_stats)
+        with st.expander("TradingView reference", expanded=False):
+            render_tradingview(symbol="BINANCE:BTCUSDT.P", height=420)
+    else:
+        render_tradingview(symbol="BINANCE:BTCUSDT.P", height=480)
+
+    with st.expander("Model thresholds & probabilities", expanded=False):
+        render_threshold_circles(stats)
+
+    st.caption(
+        f"Auto-refresh: {'on' if _AUTOREFRESH else 'manual'} · "
+        f"Store: {os.path.basename(config.DB_FILE)}"
+    )

@@ -104,6 +104,21 @@ CREATE TABLE IF NOT EXISTS trades (
     outcome         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trades_session ON trades (session_id);
+
+CREATE TABLE IF NOT EXISTS external_signals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT NOT NULL,
+    symbol      TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    price       REAL NOT NULL DEFAULT 0.0,
+    quantity    REAL NOT NULL DEFAULT 0.0,
+    agent_name  TEXT NOT NULL DEFAULT 'Unknown Agent',
+    content     TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_external_signals_ts ON external_signals (timestamp);
+CREATE INDEX IF NOT EXISTS idx_external_signals_symbol ON external_signals (symbol);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_external_signals_dedup
+    ON external_signals (timestamp, symbol);
 """
 
 
@@ -146,6 +161,19 @@ class TradeRecord:
     peak_unrealized: float
     realized_pnl: float
     outcome: str  # TP | SL | FLIP | MANUAL
+
+
+@dataclass
+class ExternalSignal:
+    """One observed operation from the public ai4trade.ai fleet (read-only)."""
+
+    timestamp: str
+    symbol: str
+    action: str
+    price: float
+    quantity: float
+    agent_name: str = "Unknown Agent"
+    content: str = ""
 
 
 class TradeStore:
@@ -213,6 +241,122 @@ class TradeStore:
                     trade.tp_price, trade.sl_price, trade.peak_unrealized,
                     trade.realized_pnl, trade.outcome,
                 ),
+            )
+
+    def external_signal_exists(self, timestamp: str, symbol: str) -> bool:
+        """Return True when this timestamp/symbol pair is already stored."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM external_signals
+                WHERE timestamp = ? AND symbol = ?
+                LIMIT 1
+                """,
+                (timestamp, symbol),
+            ).fetchone()
+        return row is not None
+
+    def insert_external_signal_if_new(self, signal: ExternalSignal) -> bool:
+        """Insert one external signal unless timestamp+symbol already exists."""
+        if self.external_signal_exists(signal.timestamp, signal.symbol):
+            return False
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO external_signals
+                    (timestamp, symbol, action, price, quantity, agent_name, content)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    signal.timestamp,
+                    signal.symbol,
+                    signal.action,
+                    signal.price,
+                    signal.quantity,
+                    signal.agent_name,
+                    signal.content,
+                ),
+            )
+        return True
+
+    def count_external_signals(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM external_signals").fetchone()
+        return int(row[0]) if row else 0
+
+    def top_external_signal_symbol(self) -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT symbol, COUNT(*) AS cnt
+                FROM external_signals
+                GROUP BY symbol
+                ORDER BY cnt DESC, symbol ASC
+                LIMIT 1
+                """
+            ).fetchone()
+        return str(row[0]) if row else "—"
+
+    def external_market_bias(self, hours: float = 12.0) -> dict[str, object]:
+        """Aggregate BUY/SHORT sentiment over the recent window."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT action, COUNT(*) AS cnt
+                FROM external_signals
+                WHERE datetime(replace(substr(timestamp, 1, 19), 'T', ' '))
+                      >= datetime('now', ?)
+                GROUP BY action
+                """,
+                (f"-{int(hours)} hours",),
+            ).fetchall()
+
+        bullish_actions = {"BUY", "COVER"}
+        bearish_actions = {"SELL", "SHORT"}
+        bullish = 0
+        bearish = 0
+        total = 0
+        for action, cnt in rows:
+            action_u = str(action or "").upper()
+            n = int(cnt)
+            total += n
+            if action_u in bullish_actions:
+                bullish += n
+            elif action_u in bearish_actions:
+                bearish += n
+
+        if total == 0:
+            label = "NEUTRAL"
+        elif bullish > bearish * 1.15:
+            label = "BULLISH"
+        elif bearish > bullish * 1.15:
+            label = "BEARISH"
+        else:
+            label = "NEUTRAL"
+
+        return {
+            "label": label,
+            "bullish": bullish,
+            "bearish": bearish,
+            "total": total,
+            "bullish_pct": (100.0 * bullish / total) if total else 0.0,
+            "bearish_pct": (100.0 * bearish / total) if total else 0.0,
+        }
+
+    def read_external_signals_df(self, limit: int = 15) -> pd.DataFrame:
+        """Return the latest external signals (newest first)."""
+        limit = max(1, int(limit))
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                """
+                SELECT id, timestamp, symbol, action, price, quantity,
+                       agent_name, content
+                FROM external_signals
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                conn,
+                params=(limit,),
             )
 
     # ------------------------------------------------------------------ #

@@ -896,3 +896,45 @@ def darvas_box_stats(
         "prev_day": state.prev_day,
         "reason": state.reason,
     }
+
+
+def radio_tower_metrics(store) -> dict[str, object]:
+    """Summary metrics for the Global AI Radio Tower dashboard panel."""
+    try:
+        total = store.count_external_signals()
+        top_symbol = store.top_external_signal_symbol()
+        bias = store.external_market_bias(hours=12.0)
+        latest = store.read_external_signals_df(limit=15)
+    except Exception as exc:
+        return {
+            "total": 0,
+            "top_symbol": "—",
+            "bias_label": "NEUTRAL",
+            "bias_detail": "No data yet",
+            "latest": pd.DataFrame(),
+            "error": str(exc),
+        }
+
+    bias_label = str(bias.get("label", "NEUTRAL"))
+    bullish_pct = float(bias.get("bullish_pct", 0.0))
+    bearish_pct = float(bias.get("bearish_pct", 0.0))
+    return {
+        "total": total,
+        "top_symbol": top_symbol,
+        "bias_label": bias_label,
+        "bias_detail": (
+            f"{bullish_pct:.0f}% bullish · {bearish_pct:.0f}% bearish (12h)"
+        ),
+        "latest": latest,
+        "error": "",
+    }
+
+
+def format_external_action_tag(action: str) -> str:
+    """Readable action tag with simple direction hint for the signal table."""
+    action_u = str(action or "").upper()
+    if action_u in {"BUY", "COVER"}:
+        return f"🟢 {action_u}"
+    if action_u in {"SELL", "SHORT"}:
+        return f"🔴 {action_u}"
+    return action_u

@@ -414,6 +414,22 @@ EXCHANGE_DEGRADED_THRESHOLD: Final[int] = int(_env("EXCHANGE_DEGRADED_THRESHOLD"
 EXCHANGE_RECONNECT_THRESHOLD: Final[int] = int(_env("EXCHANGE_RECONNECT_THRESHOLD", "5"))
 
 # --------------------------------------------------------------------------- #
+# Radio Tower — read-only ai4trade.ai fleet listener (analytical only)        #
+# --------------------------------------------------------------------------- #
+RADIO_TOWER_ENABLED: Final[bool] = _env("RADIO_TOWER_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+RADIO_TOWER_FEED_URL: Final[str] = _env(
+    "RADIO_TOWER_FEED_URL",
+    "https://ai4trade.ai/api/signals/feed?message_type=operation&market=crypto&limit=50",
+)
+RADIO_TOWER_POLL_SECONDS: Final[int] = int(_env("RADIO_TOWER_POLL_SECONDS", "60"))
+RADIO_TOWER_RETRY_SECONDS: Final[int] = int(_env("RADIO_TOWER_RETRY_SECONDS", "30"))
+RADIO_TOWER_HTTP_TIMEOUT: Final[float] = float(_env("RADIO_TOWER_HTTP_TIMEOUT", "30"))
+
+# --------------------------------------------------------------------------- #
 # Live execution — audit-parity maker fills (COMPOUND / F2 audit alignment)   #
 # --------------------------------------------------------------------------- #
 # When true: fixed config brackets, no ATR scaling, no trailing stop, and
