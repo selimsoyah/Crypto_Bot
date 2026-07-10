@@ -287,7 +287,7 @@ if is_compound_profile():
     MIN_VALIDATION_TRADES: Final[int] = int(_env("MIN_VALIDATION_TRADES", "5"))
     COMPOUND_MAX_THRESHOLD: Final[float] = float(_env("COMPOUND_MAX_THRESHOLD", "0.85"))
     # Per-direction fallbacks when no organic positive-PnL threshold qualifies.
-    LONG_FALLBACK_THRESHOLD: Final[float] = float(_env("LONG_FALLBACK_THRESHOLD", "0.78"))
+    LONG_FALLBACK_THRESHOLD: Final[float] = float(_env("LONG_FALLBACK_THRESHOLD", "0.60"))
     SHORT_FALLBACK_THRESHOLD: Final[float] = float(_env("SHORT_FALLBACK_THRESHOLD", "0.60"))
     # Back-compat alias for long-side fallback.
     FALLBACK_THRESHOLD: Final[float] = LONG_FALLBACK_THRESHOLD
