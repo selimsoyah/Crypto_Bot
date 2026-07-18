@@ -1,5 +1,6 @@
 """Tests for the read-only Radio Tower listener."""
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -8,10 +9,16 @@ import radio_tower
 from trade_store import ExternalSignal, TradeStore
 
 
+def _recent_ts(minutes_ago: int) -> str:
+    return (
+        datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 SAMPLE_FEED = {
     "signals": [
         {
-            "executed_at": "2026-07-10T14:35:32Z",
+            "executed_at": _recent_ts(5),
             "symbol": "SOL",
             "side": "buy",
             "entry_price": 77.605,
@@ -20,7 +27,7 @@ SAMPLE_FEED = {
             "content": "SOL breakout long",
         },
         {
-            "executed_at": "2026-07-10T14:34:52Z",
+            "executed_at": _recent_ts(6),
             "symbol": "NEAR",
             "side": "sell",
             "entry_price": 1.8875,
@@ -72,10 +79,10 @@ def test_ingest_feed_items_inserts_new_rows(tmp_path):
 
 def test_external_market_bias_bullish(tmp_path):
     store = TradeStore(db_path=str(tmp_path / "tower3.db"))
-    for sym, action in (("BTC", "BUY"), ("ETH", "BUY"), ("SOL", "SELL")):
+    for idx, (sym, action) in enumerate((("BTC", "BUY"), ("ETH", "BUY"), ("SOL", "SELL"))):
         store.insert_external_signal_if_new(
             ExternalSignal(
-                timestamp="2026-07-10T15:00:00Z",
+                timestamp=_recent_ts(10 - idx),
                 symbol=sym,
                 action=action,
                 price=1.0,

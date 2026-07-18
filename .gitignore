@@ -27,6 +27,7 @@ htmlcov/
 .bot_instance.lock
 .bot_runtime_snapshot.json
 bot_status_log.csv
+boardroom_consensus_log.csv
 
 # Regenerable data & model artifacts (see data_pipeline.py / model_brain.py)
 historical_btc.parquet

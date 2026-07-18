@@ -3,7 +3,7 @@
 This document tracks **every major release** of the bot: what each version does, how
 to identify it at runtime, and what changed from the previous version.
 
-**Current release:** `v2.1.0` · **Default profile:** `xgboost_ml` (`ACTIVE_PROFILE=xgboost_ml`, `FEATURE_VARIANT=F2`)  
+**Current release:** `v2.2.0` · **Default profile:** `xgboost_ml` (`ACTIVE_PROFILE=xgboost_ml`, `FEATURE_VARIANT=F2`)  
 **Alternate profile:** `darvas_box` (`ACTIVE_PROFILE=darvas_box`)
 
 ---
@@ -28,6 +28,7 @@ to identify it at runtime, and what changed from the previous version.
 | **v2.0.3** | COMPOUND + features | 15m       | —        | Phase 3 feature groups + aligned scalp brackets         |
 | **v2.0.4** | COMPOUND + F2 tune  | 15m       | **✅**    | Asymmetric thresholds, F2 audit, capital-preserving OOS |
 | **v2.1.0** | **XGBoost ML**      | **15m**   | **✅**    | ML default profile + live scan heartbeats in dashboard  |
+| **v2.2.0** | **Exchange sync**   | **15m**   | **✅**    | ReduceOnly/TIMEOUT desync fixes + alignment panic net   |
 
 
 ---
@@ -393,7 +394,7 @@ Promote a variant only if it **beats log-loss baseline** and walk-forward mean P
 
 ---
 
-### v2.0.4 — F2 tuning + asymmetric thresholds (current)
+### v2.0.4 — F2 tuning + asymmetric thresholds
 
 **Date:** 2026-07-06
 
@@ -473,7 +474,7 @@ python backtest_runner.py
 
 ---
 
-### v2.1.0 — XGBoost ML production default + live scan heartbeats (current)
+### v2.1.0 — XGBoost ML production default + live scan heartbeats
 
 **Date:** 2026-07-10
 
@@ -497,6 +498,66 @@ python backtest_runner.py
 python -c "import config; print(config.ACTIVE_PROFILE, config.FEATURE_VARIANT, config.USE_EMA50_TREND_GATE)"
 # xgboost_ml F2 False
 ```
+
+---
+
+### v2.2.0 — Exchange alignment safety net (current)
+
+**Date:** 2026-07-18
+
+**Why this release exists**
+
+After letting the bot run for **~8 days (~190 hours)** on Binance Futures Testnet
+(`session_2026-07-10_15h25m_190h3m33s`), we observed two catastrophic execution bugs:
+
+1. **ReduceOnly loop of death (`APIError -2022`)** — while holding an active SHORT, every
+   loop iteration spam-logged `ReduceOnly Order is rejected`, so hard TP/SL could not
+   execute cleanly. The session CSV showed **+$54.67** “net realized” while the wallet
+   fell from **~$5,000 → ~$3,365** because an unclosed exchange position kept bleeding.
+2. **TIMEOUT ghost position** — Trade ID 19 logged a TIMEOUT close (−$7.71) and cleared
+   local state to FLAT **without confirming** the exchange was flat, leaving a phantom
+   SHORT running.
+
+Additional production signal from that run: **19 shorts / 0 longs** at equal 0.60
+thresholds → model probability drift / long starvation needs visibility.
+
+**What v2.2.0 changes**
+
+- **`verify_exchange_alignment()`** at the end of every `_iteration`: if local is FLAT but
+  exchange has size (or sides disagree), **panic market-flatten**, alert, and pause new
+  entries until manual resume. Re-entrancy guard prevents infinite panic loops.
+- **Hardened `_close_position` / TIMEOUT**: sync side/qty from the live exchange before
+  ordering; escalate failed maker exits to MARKET; **never** clear local / record a trade
+  until `fetch_open_position` confirms qty == 0; residual size → emergency flatten.
+- **ReduceOnly (-2022) path**: detect, recalibrate from exchange, one emergency flatten —
+  no more per-loop spam that skips bracket management.
+- **`flatten_position_market`**: always re-fetches exchange position; uses exchange side/qty;
+  treats -2022 + already-FLAT as success.
+- **`PROB DRIFT` logger**: every `PROB_DRIFT_LOG_EVERY` scans, print avg/max Prob_Long vs
+  Prob_Short and threshold-clear counts (diagnoses short-only bias).
+- **Quantity rounding** via `order_execution.round_quantity` (LOT_SIZE floor) to reduce
+  float dust rejects on market closes.
+
+**Config**
+
+- `EXCHANGE_ALIGNMENT_CHECK=true` (default)
+- `PROB_DRIFT_LOG_EVERY=60`
+
+**Verify**
+
+```bash
+python -c "import config; print(config.EXCHANGE_ALIGNMENT_CHECK, config.PROB_DRIFT_LOG_EVERY)"
+# True 60
+python -m pytest tests/test_exchange_alignment.py tests/test_state_machine.py -q
+```
+
+**Changed from v2.1.0 → v2.2.0**
+
+- Exchange is source of truth for closes; local ledger cannot claim FLAT while size remains
+- Alignment panic + manual-resume pause on desync
+- Production-log-driven fix after 190h testnet session bleed
+
+---
 
 Dashboard Session Activity should show a new `SCAN` row every ~5 seconds while the engine is running.
 

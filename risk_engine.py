@@ -145,6 +145,15 @@ class RiskEngine:
         except OSError as exc:
             logger.warning("Could not remove manual resume file: %s", exc)
 
+    def require_manual_resume(self, reason: str) -> None:
+        """Pause new entries until the operator confirms resume (desync / panic)."""
+        with self._lock:
+            self.state.manual_resume_required = True
+            self.state.halted = True
+            self.state.halt_reason = reason
+        self._write_manual_resume_file()
+        logger.warning("Manual resume required: %s", reason)
+
     def confirm_manual_resume(self) -> RiskDecision:
         """Operator acknowledges consecutive-loss pause — allows trading again."""
         with self._lock:

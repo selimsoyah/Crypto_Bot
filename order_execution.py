@@ -140,6 +140,32 @@ def _is_post_only_reject(exc: Exception) -> bool:
     return any(n in msg for n in needles)
 
 
+def is_reduce_only_reject(exc: Exception) -> bool:
+    """True when Binance rejects a reduce-only order (code -2022)."""
+    msg = str(exc)
+    code = getattr(exc, "code", None)
+    if code == -2022:
+        return True
+    needles = (
+        "-2022",
+        "ReduceOnly Order is rejected",
+        "ReduceOnly",
+        "reduce only",
+    )
+    return any(n in msg for n in needles)
+
+
+def round_quantity(quantity: float, step_size: float, precision: int) -> float:
+    """Floor quantity to the exchange LOT_SIZE step (avoids float dust rejects)."""
+    if quantity <= 0:
+        return 0.0
+    if step_size > 0:
+        steps = int(quantity / step_size)
+        floored = steps * step_size
+        return float(round(floored, precision))
+    return float(round(quantity, precision))
+
+
 def _extract_fill_price(order: dict[str, Any], fallback: float) -> float:
     try:
         avg = order.get("avgPrice")
@@ -325,17 +351,75 @@ def flatten_position_market(
     symbol: str,
     quantity: float,
     position_side: str,
+    step_size: float = 0.0,
+    qty_precision: int = 3,
 ) -> dict[str, Any]:
-    """Market-close an open futures position (reduce-only)."""
-    if quantity <= 0:
-        return {}
-    close_side = "SELL" if position_side.upper() == "LONG" else "BUY"
-    return exchange_client.call_with_retry(
-        client.futures_create_order,
-        symbol=symbol,
-        side=close_side,
-        type="MARKET",
-        quantity=quantity,
-        reduceOnly=True,
-        label="futures_flatten_market",
-    )
+    """Market-close an open futures position using exchange-verified side/qty.
+
+    Always prefers a fresh ``fetch_open_position`` snapshot over caller-provided
+    side/qty so we never spam ReduceOnly (-2022) against a flat/mismatched book.
+    """
+    snap = fetch_open_position(client, symbol)
+    if snap["side"] == "FLAT" or float(snap["quantity"]) <= 0:
+        logger.info("Flatten skipped — exchange already FLAT for %s.", symbol)
+        return {"status": "ALREADY_FLAT", "side": "FLAT", "quantity": 0.0}
+
+    live_side = str(snap["side"])
+    live_qty = float(snap["quantity"])
+    if position_side and position_side.upper() not in {"", live_side}:
+        logger.warning(
+            "Flatten side mismatch — caller said %s but exchange is %s; using exchange.",
+            position_side,
+            live_side,
+        )
+    qty = round_quantity(live_qty, step_size, qty_precision)
+    if qty <= 0:
+        qty = live_qty
+    if quantity > 0:
+        requested = round_quantity(float(quantity), step_size, qty_precision)
+        if 0 < requested < qty:
+            qty = requested
+
+    close_side = "SELL" if live_side == "LONG" else "BUY"
+    try:
+        order = exchange_client.call_with_retry(
+            client.futures_create_order,
+            symbol=symbol,
+            side=close_side,
+            type="MARKET",
+            quantity=qty,
+            reduceOnly=True,
+            label="futures_flatten_market",
+            attempts=2,
+        )
+    except Exception as exc:
+        if not is_reduce_only_reject(exc):
+            raise
+        # -2022: recalibrate — often the position was already closed.
+        refreshed = fetch_open_position(client, symbol)
+        if refreshed["side"] == "FLAT" or float(refreshed["quantity"]) <= 0:
+            logger.warning(
+                "ReduceOnly -2022 on flatten but exchange is FLAT — treating as success."
+            )
+            return {"status": "ALREADY_FLAT", "side": "FLAT", "quantity": 0.0}
+        # Retry once with the refreshed exchange qty/side (no blind reduceOnly spam).
+        qty2 = round_quantity(float(refreshed["quantity"]), step_size, qty_precision)
+        if qty2 <= 0:
+            qty2 = float(refreshed["quantity"])
+        close_side2 = "SELL" if refreshed["side"] == "LONG" else "BUY"
+        logger.warning(
+            "ReduceOnly -2022 — retrying flatten with exchange %s qty=%s",
+            refreshed["side"],
+            qty2,
+        )
+        order = exchange_client.call_with_retry(
+            client.futures_create_order,
+            symbol=symbol,
+            side=close_side2,
+            type="MARKET",
+            quantity=qty2,
+            reduceOnly=True,
+            label="futures_flatten_market_retry",
+            attempts=2,
+        )
+    return order if isinstance(order, dict) else {"status": "OK"}

@@ -847,6 +847,12 @@ class TradingBot:
         self._darvas_daily_low: Optional[float] = None
         self._darvas_consumed_signal_ts: Optional[str] = None
         self._radio_tower = None
+        # Alignment panic: True while emergency flatten is in-flight (re-entrancy guard).
+        self._alignment_panic_active: bool = False
+        # Rolling probability samples for long/short starvation diagnostics.
+        self._prob_long_samples: list[float] = []
+        self._prob_short_samples: list[float] = []
+        self._prob_drift_scans: int = 0
         if config.RADIO_TOWER_ENABLED:
             from radio_tower import RadioTowerListener
 
@@ -1140,6 +1146,8 @@ class TradingBot:
                 symbol=config.SYMBOL,
                 quantity=qty,
                 position_side=snap["side"],
+                step_size=self._step_size,
+                qty_precision=self._qty_precision,
             )
         except Exception as exc:
             logger.error(
@@ -1212,11 +1220,213 @@ class TradingBot:
         self.risk.clear_kill_switch()
 
     def _round_step(self, quantity: float) -> float:
-        step = self._step_size
-        if step <= 0:
-            return round(quantity, self._qty_precision)
-        floored = int(quantity / step) * step
-        return float(round(floored, self._qty_precision))
+        return order_execution.round_quantity(
+            quantity, self._step_size, self._qty_precision
+        )
+
+    def _confirm_exchange_flat(self) -> bool:
+        """Return True when the exchange reports no open size (or client unavailable)."""
+        if self._client is None:
+            return True
+        try:
+            snap = order_execution.fetch_open_position(self._client, config.SYMBOL)
+        except Exception as exc:
+            logger.error(
+                "Could not confirm exchange flat: %s",
+                config.sanitize_for_log(str(exc)),
+            )
+            return False
+        return snap["side"] == "FLAT" or float(snap.get("quantity", 0.0) or 0.0) <= 0
+
+    def _recalibrate_position_from_exchange(self) -> dict[str, float | str]:
+        """Fetch live position and optionally rebuild local state from it."""
+        if self._client is None:
+            return {"side": "FLAT", "quantity": 0.0, "entry_price": 0.0}
+        snap = order_execution.fetch_open_position(self._client, config.SYMBOL)
+        local = self.state.position
+        if snap["side"] == "FLAT":
+            if local is not None:
+                logger.warning(
+                    "Recalibrate: exchange FLAT but local held %s — clearing local ghost.",
+                    local.side,
+                )
+                with self.state._lock:
+                    self.state.position = None
+            return snap
+        if local is None:
+            logger.critical(
+                "Recalibrate: exchange %s qty=%s but local FLAT — orphan detected.",
+                snap["side"],
+                snap["quantity"],
+            )
+            return snap
+        if local.side != snap["side"]:
+            logger.critical(
+                "Recalibrate: local %s vs exchange %s — adopting exchange side.",
+                local.side,
+                snap["side"],
+            )
+            local.side = str(snap["side"])
+        live_qty = float(snap["quantity"])
+        local_qty = local.quantity_open if local.quantity_open > 0 else local.quantity
+        if abs(local_qty - live_qty) > max(self._step_size, 1e-9):
+            logger.warning(
+                "Recalibrate qty: local %.6f → exchange %.6f",
+                local_qty,
+                live_qty,
+            )
+            local.quantity = live_qty
+            local.quantity_open = live_qty
+        if float(snap.get("entry_price", 0.0) or 0.0) > 0:
+            local.entry_price = float(snap["entry_price"])
+        return snap
+
+    def verify_exchange_alignment(self) -> bool:
+        """End-of-loop safety net: compare local state vs live exchange position.
+
+        Defensive structure
+        -------------------
+        1. Re-entrancy guard — never nest panic flattens (avoids infinite loops).
+        2. Fetch live exchange position (source of truth).
+        3. Compare to local BotState.position (FLAT / LONG / SHORT).
+        4. On catastrophic desync → market-flatten exchange size, clear local,
+           alert, and pause new entries until manual resume.
+        5. Returns True when aligned (or check disabled / no client).
+        """
+        if not config.EXCHANGE_ALIGNMENT_CHECK:
+            return True
+        if self._client is None:
+            return True
+        # Prevent recursive panic if flatten itself triggers another iteration path.
+        if self._alignment_panic_active:
+            return False
+
+        try:
+            snap = order_execution.fetch_open_position(self._client, config.SYMBOL)
+        except Exception as exc:
+            logger.error(
+                "Alignment check skipped — position fetch failed: %s",
+                config.sanitize_for_log(str(exc)),
+            )
+            return True  # fail-open on read errors; do not panic-flatten blindly
+
+        exchange_side = str(snap.get("side", "FLAT"))
+        exchange_qty = float(snap.get("quantity", 0.0) or 0.0)
+        local = self.state.position
+        local_side = local.side if local is not None else "FLAT"
+
+        desync = False
+        detail = ""
+        if local is None and exchange_side != "FLAT" and exchange_qty > 0:
+            desync = True
+            detail = (
+                f"Local FLAT but exchange holds {exchange_side} qty={exchange_qty} "
+                f"— ghost/orphan position."
+            )
+        elif local is not None and exchange_side == "FLAT":
+            desync = True
+            detail = (
+                f"Local {local_side} but exchange FLAT — stale local state "
+                "(close may have filled without ledger sync)."
+            )
+        elif local is not None and exchange_side not in {"FLAT", local_side}:
+            desync = True
+            detail = (
+                f"Side mismatch: local {local_side} vs exchange {exchange_side} "
+                f"qty={exchange_qty}."
+            )
+
+        if not desync:
+            return True
+
+        logger.critical("EXCHANGE DESYNC DETECTED: %s", detail)
+        self._alignment_panic_active = True
+        try:
+            price = float(self.state.last_price or snap.get("entry_price") or 0.0)
+            flattened = False
+            if exchange_side != "FLAT" and exchange_qty > 0:
+                flattened = self._flatten_exchange_orphans(
+                    price,
+                    context=f"Alignment panic: {detail}",
+                )
+                # Second confirm — do not loop forever if flatten fails.
+                if not self._confirm_exchange_flat():
+                    logger.critical(
+                        "Alignment panic flatten did not clear exchange position — "
+                        "manual intervention required."
+                    )
+            with self.state._lock:
+                self.state.position = None
+                self.state.last_action = "DESYNC_FLATTEN"
+                self.state.last_event = "WARNING"
+                self.state.last_reason = f"EXCHANGE DESYNC — {detail}"
+            self._log_status(price or 0.0, transition=True)
+            self.risk.require_manual_resume(
+                f"Exchange desync panic flatten. {detail} "
+                "New entries paused until dashboard Confirm Risk Resume."
+            )
+            send_alert(
+                "CRITICAL",
+                "Exchange desync panic",
+                detail,
+                key="exchange_desync",
+            )
+            return flattened and self._confirm_exchange_flat()
+        finally:
+            self._alignment_panic_active = False
+
+    def _handle_reduce_only_rejection(self, exc: Exception, price: float) -> None:
+        """On API -2022: recalibrate from exchange; flatten orphans; never spam."""
+        logger.error(
+            "ReduceOnly rejected (-2022): %s — recalibrating from exchange.",
+            config.sanitize_for_log(str(exc)),
+        )
+        try:
+            snap = self._recalibrate_position_from_exchange()
+        except Exception as fetch_exc:
+            logger.error(
+                "Recalibrate after -2022 failed: %s",
+                config.sanitize_for_log(str(fetch_exc)),
+            )
+            self._set_reason(
+                "WARNING",
+                "REDUCE_ONLY_REJECT",
+                f"ReduceOnly -2022 and recalibrate failed: {fetch_exc}",
+            )
+            return
+
+        if snap["side"] == "FLAT":
+            with self.state._lock:
+                self.state.position = None
+            self._set_reason(
+                "WARNING",
+                "REDUCE_ONLY_RECALIBRATED",
+                "ReduceOnly -2022: exchange already FLAT — cleared local position.",
+            )
+            return
+
+        # Exchange still open — one emergency market sweep (guarded).
+        if not self._alignment_panic_active:
+            self._alignment_panic_active = True
+            try:
+                self._flatten_exchange_orphans(
+                    price,
+                    context="ReduceOnly -2022 emergency flatten",
+                )
+                if self._confirm_exchange_flat():
+                    with self.state._lock:
+                        self.state.position = None
+                else:
+                    self.risk.require_manual_resume(
+                        "ReduceOnly -2022: emergency flatten did not clear position."
+                    )
+            finally:
+                self._alignment_panic_active = False
+        self._set_reason(
+            "WARNING",
+            "REDUCE_ONLY_REJECT",
+            f"ReduceOnly -2022 handled — exchange was {snap['side']} qty={snap['quantity']}.",
+        )
 
     # ------------------------------------------------------------------ #
     # Order execution (futures — post-only maker limits)                   #
@@ -1269,6 +1479,42 @@ class TradingBot:
             direction,
             ema_note,
         )
+        # Rolling drift diagnostics — explains long starvation when thresholds are equal.
+        self._prob_long_samples.append(float(p_long))
+        self._prob_short_samples.append(float(p_short))
+        self._prob_drift_scans += 1
+        window = max(1, int(config.PROB_DRIFT_LOG_EVERY))
+        if self._prob_drift_scans % window == 0:
+            n = min(len(self._prob_long_samples), window)
+            recent_l = self._prob_long_samples[-n:]
+            recent_s = self._prob_short_samples[-n:]
+            avg_l = sum(recent_l) / n
+            avg_s = sum(recent_s) / n
+            max_l = max(recent_l)
+            max_s = max(recent_s)
+            long_pass = sum(1 for v in recent_l if v > long_thr)
+            short_pass = sum(1 for v in recent_s if v > short_thr)
+            logger.info(
+                "PROB DRIFT | last %d scans | avg LONG %.4f (max %.4f, thr-clears %d) | "
+                "avg SHORT %.4f (max %.4f, thr-clears %d) | bias=%s | thr L/S %.3f/%.3f",
+                n,
+                avg_l,
+                max_l,
+                long_pass,
+                avg_s,
+                max_s,
+                short_pass,
+                "SHORT_HEAVY" if avg_s > avg_l + 0.02 else (
+                    "LONG_HEAVY" if avg_l > avg_s + 0.02 else "BALANCED"
+                ),
+                long_thr,
+                short_thr,
+            )
+            # Cap memory — keep at most 2 windows.
+            cap = window * 2
+            if len(self._prob_long_samples) > cap:
+                self._prob_long_samples = self._prob_long_samples[-cap:]
+                self._prob_short_samples = self._prob_short_samples[-cap:]
 
     def _reject_entry(
         self,
@@ -1363,7 +1609,7 @@ class TradingBot:
             logger.warning(reason)
             return
 
-        if config.is_xgboost_ml_profile() and config.CONFLUENCE_GATE_ENABLED:
+        if config.is_xgboost_ml_profile() and config.CONFLUENCE_GATE_ENABLED and not config.BOARDROOM_ENABLED:
             from confluence_gate import verify_btc_trade_safety
 
             if not verify_btc_trade_safety(direction, store=self.store):
@@ -1714,45 +1960,69 @@ class TradingBot:
         book: Optional[order_execution.BookTicker] = None,
         force_market: bool = False,
     ) -> None:
-        """Close the open position with a reduce-only post-only limit order.
+        """Close the open position; never clear local state until exchange is flat.
 
         ``reason_code`` is one of ``TP``, ``SL``, ``TIMEOUT``, ``FLIP``, or
-        ``MANUAL``. The CLOSE transition is logged as its own row and the
-        completed trade is written atomically to the ground-truth ``trades`` table.
+        ``MANUAL``. Close side/qty are taken from the live exchange position when
+        available so ReduceOnly (-2022) cannot spam against a mismatched book.
         """
         pos = self.state.position
         if pos is None:
             return
 
-        # Closing a LONG means SELL; closing a SHORT means BUY.
-        side = "SELL" if pos.side == "LONG" else "BUY"
-        quantity = self._round_step(pos.quantity_open if pos.quantity_open > 0 else pos.quantity)
+        # --- Sync with exchange before ordering --------------------------- #
+        exchange_side = pos.side
+        quantity = self._round_step(
+            pos.quantity_open if pos.quantity_open > 0 else pos.quantity
+        )
+        if self._client is not None:
+            try:
+                snap = order_execution.fetch_open_position(self._client, config.SYMBOL)
+                if snap["side"] == "FLAT" or float(snap["quantity"]) <= 0:
+                    logger.warning(
+                        "Close %s skipped — exchange already FLAT (local %s). "
+                        "Clearing ghost local state without recording a false fill.",
+                        reason_code,
+                        pos.side,
+                    )
+                    with self.state._lock:
+                        self.state.position = None
+                        self.state.last_action = f"CLOSE_{pos.side}_{reason_code}_GHOST"
+                        self.state.last_event = "WARNING"
+                        self.state.last_reason = (
+                            f"Local {pos.side} cleared — exchange already flat "
+                            f"before {reason_code} close."
+                        )
+                    self._log_status(price, transition=True)
+                    return
+                exchange_side = str(snap["side"])
+                quantity = self._round_step(float(snap["quantity"]))
+                if quantity <= 0:
+                    quantity = float(snap["quantity"])
+                if exchange_side != pos.side:
+                    logger.warning(
+                        "Close side desync: local %s vs exchange %s — using exchange.",
+                        pos.side,
+                        exchange_side,
+                    )
+                    pos.side = exchange_side
+            except Exception as exc:
+                logger.warning(
+                    "Pre-close position sync failed (%s) — using local state.",
+                    config.sanitize_for_log(str(exc)),
+                )
+
         if quantity <= 0:
             quantity = pos.quantity_open if pos.quantity_open > 0 else pos.quantity
 
+        # Closing a LONG means SELL; closing a SHORT means BUY.
+        side = "SELL" if pos.side == "LONG" else "BUY"
         use_maker = config.USE_POST_ONLY_MAKER and not force_market
+        fill_price = price
+        exit_mode = "MARKET"
+        order_ok = False
 
-        if use_maker:
-            order_result = self._execute_maker_limit(
-                side, quantity, reduce_only=True, book=book
-            )
-            if not order_result.success:
-                detail = order_result.reason or "Post-only exit did not fill"
-                logger.warning(
-                    "Skipped Exit [%s %s]: %s — will retry next scan.",
-                    pos.side,
-                    reason_code,
-                    detail,
-                )
-                self._set_reason(
-                    "WARNING",
-                    f"EXIT_PENDING_{reason_code}",
-                    f"Post-only exit pending for {pos.side}: {detail}",
-                )
-                return
-            fill_price = order_result.fill_price
-            exit_mode = "POST-ONLY LIMIT (GTX/maker)"
-        else:  # pragma: no cover - legacy path
+        def _market_close() -> float:
             order = exchange_client.call_with_retry(
                 self._client.futures_create_order,
                 symbol=config.SYMBOL,
@@ -1760,10 +2030,102 @@ class TradingBot:
                 type="MARKET",
                 quantity=quantity,
                 reduceOnly=True,
-                label="futures_create_order",
+                label="futures_close_market",
+                attempts=2,
             )
-            fill_price = self._extract_fill_price(order, fallback=price)
-            exit_mode = "MARKET"
+            return self._extract_fill_price(order, fallback=price)
+
+        try:
+            if use_maker:
+                order_result = self._execute_maker_limit(
+                    side, quantity, reduce_only=True, book=book
+                )
+                if order_result.success:
+                    fill_price = order_result.fill_price
+                    exit_mode = "POST-ONLY LIMIT (GTX/maker)"
+                    order_ok = True
+                else:
+                    detail = order_result.reason or "Post-only exit did not fill"
+                    # TIMEOUT / risk exits escalate immediately — never idle as ghost.
+                    if reason_code in {"TIMEOUT", "MANUAL", "SL", "TP", "FLIP"}:
+                        logger.warning(
+                            "Maker exit failed for %s (%s) — escalating to MARKET sweep.",
+                            reason_code,
+                            detail,
+                        )
+                        fill_price = _market_close()
+                        exit_mode = "MARKET (escalated)"
+                        order_ok = True
+                    else:
+                        logger.warning(
+                            "Skipped Exit [%s %s]: %s — will retry next scan.",
+                            pos.side,
+                            reason_code,
+                            detail,
+                        )
+                        self._set_reason(
+                            "WARNING",
+                            f"EXIT_PENDING_{reason_code}",
+                            f"Post-only exit pending for {pos.side}: {detail}",
+                        )
+                        return
+            else:
+                fill_price = _market_close()
+                exit_mode = "MARKET"
+                order_ok = True
+        except Exception as exc:
+            if order_execution.is_reduce_only_reject(exc):
+                self._handle_reduce_only_rejection(exc, price)
+                # If exchange is now flat we can finish the ledger; else abort.
+                if not self._confirm_exchange_flat():
+                    return
+                fill_price = price
+                exit_mode = "MARKET (recalibrated after -2022)"
+                order_ok = True
+            elif reason_code in {"TIMEOUT", "MANUAL", "SL", "TP"}:
+                logger.error(
+                    "Close order failed for %s: %s — emergency flatten.",
+                    reason_code,
+                    config.sanitize_for_log(str(exc)),
+                )
+                if not self._flatten_exchange_orphans(
+                    price, context=f"{reason_code} close failure"
+                ):
+                    self._set_reason(
+                        "WARNING",
+                        f"EXIT_FAILED_{reason_code}",
+                        f"Close failed and emergency flatten failed: {exc}",
+                    )
+                    return
+                fill_price = price
+                exit_mode = "MARKET (emergency flatten)"
+                order_ok = True
+            else:
+                raise
+
+        if not order_ok:
+            return
+
+        # --- Hard gate: never mark closed locally until exchange is flat --- #
+        if not self._confirm_exchange_flat():
+            logger.error(
+                "%s close reported success but exchange still open — emergency sweep.",
+                reason_code,
+            )
+            if not self._flatten_exchange_orphans(
+                fill_price, context=f"{reason_code} residual position"
+            ):
+                self._set_reason(
+                    "WARNING",
+                    f"EXIT_PENDING_{reason_code}",
+                    f"{reason_code} residual size remains on exchange — not clearing local.",
+                )
+                return
+            if not self._confirm_exchange_flat():
+                self.risk.require_manual_resume(
+                    f"{reason_code} close left residual size; manual flatten required."
+                )
+                return
 
         if pos.side == "LONG":
             pnl = (fill_price - pos.entry_price) * quantity
@@ -1792,7 +2154,7 @@ class TradingBot:
             reason = (
                 f"Time horizon reached ({bars} bars / {config.INTERVAL} without "
                 f"organic TP/SL; {pct:+.2f}%). Executed {exit_mode} {side} to "
-                f"close {pos.side} at ${fill_price:,.2f}."
+                f"close {pos.side} at ${fill_price:,.2f}. Exchange confirmed FLAT."
             )
         elif reason_code == "MANUAL":
             event = "STOP_LOSS"
@@ -2019,6 +2381,21 @@ class TradingBot:
                 use_ema50_gate=False,
             )
             self._log_directional_signal(signal, direction)
+            execution_direction = direction
+            boardroom_resolution = None
+            if config.BOARDROOM_ENABLED:
+                from agent_boardroom import resolve_boardroom_verdict
+
+                boardroom_resolution = resolve_boardroom_verdict(
+                    direction, store=self.store
+                )
+                execution_direction = boardroom_resolution.execution_direction
+                if boardroom_resolution.override:
+                    with self.state._lock:
+                        self.state.last_reason = (
+                            f"Boardroom override → {boardroom_resolution.verdict}: "
+                            f"{boardroom_resolution.detail}"
+                        )
         else:
             daily_high, daily_low = self._resolve_darvas_daily_bounds()
             box_state = self._box_engine.evaluate(
@@ -2042,6 +2419,8 @@ class TradingBot:
                 "trend": 0.0,
             }
             signal_label = "Darvas Box"
+            execution_direction = direction
+            boardroom_resolution = None
             if box_state.valid and direction in {"LONG", "SHORT"}:
                 entry_brackets = self._box_brackets(direction, live_price, box_state)
             logger.info(
@@ -2157,12 +2536,15 @@ class TradingBot:
                         pos = None
 
         # --- Directional entry / flip logic ------------------------------ #
+        trade_direction = (
+            execution_direction if config.is_xgboost_ml_profile() else direction
+        )
         post_sl_blocked, post_sl_reason = self._post_sl_entry_blocked()
         if post_sl_blocked and self.state.position is None:
             self._set_reason("CASH", "HOLD", post_sl_reason)
         elif self._bracket_closed_this_iteration:
             pass
-        elif direction == "LONG":
+        elif trade_direction == "LONG":
             if pos is not None and pos.side == "SHORT":
                 self._close_position(live_price, reason_code="FLIP")
                 pos = None
@@ -2178,7 +2560,7 @@ class TradingBot:
                 )
                 if config.is_darvas_box_profile() and box_state and self.state.position is not None:
                     self._darvas_consumed_signal_ts = box_state.timestamp
-        elif direction == "SHORT":
+        elif trade_direction == "SHORT":
             if pos is not None and pos.side == "LONG":
                 self._close_position(live_price, reason_code="FLIP")
                 pos = None
@@ -2198,7 +2580,14 @@ class TradingBot:
             # CASH: explain why no trade was taken (only when flat; if a position
             # is open the bracket messages above already describe the state).
             if pos is None:
-                if config.is_xgboost_ml_profile():
+                if (
+                    config.is_xgboost_ml_profile()
+                    and boardroom_resolution is not None
+                    and not boardroom_resolution.passthrough
+                ):
+                    cash_reason = boardroom_resolution.detail
+                    logger.info("Boardroom hold: %s", cash_reason)
+                elif config.is_xgboost_ml_profile():
                     cash_reason = self._cash_reason(signal)
                     if (
                         signal["prob_long"] > self._long_threshold
@@ -2222,6 +2611,9 @@ class TradingBot:
             self._log_status(price)
         else:
             self._write_runtime_snapshot()
+
+        # Safety net — always run last so a ghost/orphan cannot survive a scan.
+        self.verify_exchange_alignment()
 
     def _write_runtime_snapshot(self) -> None:
         import bot_runtime
@@ -2459,18 +2851,24 @@ class TradingBot:
                     safe = config.sanitize_for_log(str(exc))
                     self.state.last_error = safe
                     logger.error("Iteration error: %s", safe)
-                    transient = self._is_transient_error(exc)
-                    if transient:
-                        self._mark_api_failure(exc, "Iteration")
-                    self._log_iteration_error(safe, degraded=transient)
-                    send_alert(
-                        "ERROR",
-                        "Iteration error",
-                        safe,
-                        key="iteration_error",
-                    )
-                    if transient:
-                        self._stop_event.wait(config.EXCHANGE_RETRY_BASE_DELAY)
+                    if order_execution.is_reduce_only_reject(exc):
+                        self._handle_reduce_only_rejection(
+                            exc, float(self.state.last_price or 0.0)
+                        )
+                        self._log_iteration_error(safe, degraded=False)
+                    else:
+                        transient = self._is_transient_error(exc)
+                        if transient:
+                            self._mark_api_failure(exc, "Iteration")
+                        self._log_iteration_error(safe, degraded=transient)
+                        send_alert(
+                            "ERROR",
+                            "Iteration error",
+                            safe,
+                            key="iteration_error",
+                        )
+                        if transient:
+                            self._stop_event.wait(config.EXCHANGE_RETRY_BASE_DELAY)
                 self._stop_event.wait(config.LOOP_SLEEP_SECONDS)
         finally:
             if self._radio_tower is not None:

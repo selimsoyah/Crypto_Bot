@@ -52,6 +52,9 @@ def bot(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(tb, "_get_usdt_balance", lambda: 5_000.0)
     monkeypatch.setattr(tb, "_get_total_wallet_balance", lambda: 5_000.0)
+    monkeypatch.setattr(tb, "_flatten_exchange_orphans", lambda *a, **k: False)
+    monkeypatch.setattr(tb, "_confirm_exchange_flat", lambda: True)
+    monkeypatch.setattr(tb, "verify_exchange_alignment", lambda: True)
     tb.risk.begin_session(5_000.0)
     return tb
 

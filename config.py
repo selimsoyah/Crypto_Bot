@@ -391,6 +391,12 @@ KILL_SWITCH_FILE: Final[str] = str(BASE_DIR / _env("KILL_SWITCH_FILE", ".bot_kil
 RISK_MANUAL_RESUME_FILE: Final[str] = str(
     BASE_DIR / _env("RISK_MANUAL_RESUME_FILE", ".bot_risk_manual_resume_required")
 )
+# End-of-loop exchange vs local position sync (panic-flatten on desync).
+EXCHANGE_ALIGNMENT_CHECK: Final[bool] = _env(
+    "EXCHANGE_ALIGNMENT_CHECK", "true"
+).lower() in ("1", "true", "yes")
+# How often to emit Prob_Long vs Prob_Short drift summaries (scan count).
+PROB_DRIFT_LOG_EVERY: Final[int] = int(_env("PROB_DRIFT_LOG_EVERY", "60"))
 RUNTIME_SNAPSHOT_FILE: Final[str] = str(
     BASE_DIR / _env("RUNTIME_SNAPSHOT_FILE", ".bot_runtime_snapshot.json")
 )
@@ -446,6 +452,16 @@ CONFLUENCE_LONG_MIN_BULLISH_PCT: Final[float] = float(
 CONFLUENCE_SHORT_MAX_BULLISH_PCT: Final[float] = float(
     _env("CONFLUENCE_SHORT_MAX_BULLISH_PCT", "60")
 )
+
+# --------------------------------------------------------------------------- #
+# Agent Boardroom — executive radar override vs local ML signal               #
+# --------------------------------------------------------------------------- #
+BOARDROOM_ENABLED: Final[bool] = _env("BOARDROOM_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+BOARDROOM_CONSENSUS_LOG: Final[str] = str(BASE_DIR / "boardroom_consensus_log.csv")
 
 # --------------------------------------------------------------------------- #
 # Live execution — audit-parity maker fills (COMPOUND / F2 audit alignment)   #
